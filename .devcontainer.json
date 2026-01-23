@@ -1,9 +1,19 @@
 {
-    "image": "cis5710/hw-base-gradescope:v2",
-
-    "customizations": {
+  "image": "cis5710/hw-base-gradescope:v2",
+  "customizations": {
     "vscode": {
-        "extensions": ["mshr-h.veriloghdl", "lramseyer.vaporview", "ms-python.python"]
+      "extensions": [
+        "mshr-h.veriloghdl",
+        "lramseyer.vaporview",
+        "ms-python.python"
+      ]
     }
+  },
+
+  "mounts": [
+    "source=${localEnv:SSH_AUTH_SOCK},target=/ssh-agent,type=bind"
+  ],
+  "remoteEnv": {
+    "SSH_AUTH_SOCK": "/ssh-agent"
   }
 }
