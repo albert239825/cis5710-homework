@@ -15,6 +15,20 @@ _start:
         la a0, input_string
 
         # Your code here!
+loop:
+        lbu     t0, 0(a0)
+        beqz    t0, end_program
+
+        li      t1, 'a'
+        blt     t0, t1, next
+        li      t1, 'z'
+        blt     t1, t0, next
+        addi    t0, t0, -32
+
+next:
+        sb      t0, 0(a0)
+        addi    a0, a0, 1
+        j       loop
         
 end_program:
         # jump here when you're done
