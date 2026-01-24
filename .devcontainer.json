@@ -10,10 +10,9 @@
     }
   },
 
+  // allow ssh agent for using host machine ssh keys
   "mounts": [
-    "source=${localEnv:SSH_AUTH_SOCK},target=/ssh-agent,type=bind"
-  ],
-  "remoteEnv": {
-    "SSH_AUTH_SOCK": "/ssh-agent"
-  }
+    // Mount keys (read-only)
+    "type=bind,source=${localEnv:HOME}/.ssh,target=/home/penn/.ssh,readonly"
+  ]
 }
