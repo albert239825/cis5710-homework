@@ -21,9 +21,9 @@ module DividerOneIter (
     input  wire [31:0] i_divisor,
     input  wire [31:0] i_remainder,
     input  wire [31:0] i_quotient,
-    output wire [31:0] o_dividend,
-    output wire [31:0] o_remainder,
-    output wire [31:0] o_quotient
+    output logic [31:0] o_dividend,
+    output logic [31:0] o_remainder,
+    output logic [31:0] o_quotient
 );
   /*
     for (int i = 0; i < 32; i++) {
@@ -40,16 +40,18 @@ module DividerOneIter (
 
     // TODO: your code here
 
-    logic [31:0] rem_shift = i_remainder << 1 | (i_dividend >> 31) & 0x1;
+    logic [31:0] rem_shift;
 
-    if (rem_shift < i_divisor) {
-        o_quotient = i_quotient << 1;
-        o_remainder = rem_shift;
-    } else {
-        o_quotient = i_quotient << 1 | 0x1;
-        o_remainder = rem_shift - i_divisor;
-    }
-
-    o_dividend = i_dividend << 1;
+    always_comb begin
+        rem_shift = i_remainder << 1 | {31'b0, i_dividend[31]};
+        if (rem_shift < i_divisor) begin
+            o_quotient = i_quotient << 1;
+            o_remainder = rem_shift;
+        end else begin
+            o_quotient = {i_quotient[31:1], 1'b1};
+            o_remainder = rem_shift - i_divisor;
+        end
+        o_dividend = {i_dividend[31:1], 1'b0};
+    end
 
 endmodule
