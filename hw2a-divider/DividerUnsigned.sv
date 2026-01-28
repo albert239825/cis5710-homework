@@ -40,4 +40,16 @@ module DividerOneIter (
 
     // TODO: your code here
 
+    logic [31:0] rem_shift = i_remainder << 1 | (i_dividend >> 31) & 0x1;
+
+    if (rem_shift < i_divisor) {
+        o_quotient = i_quotient << 1;
+        o_remainder = rem_shift;
+    } else {
+        o_quotient = i_quotient << 1 | 0x1;
+        o_remainder = rem_shift - i_divisor;
+    }
+
+    o_dividend = i_dividend << 1;
+
 endmodule
