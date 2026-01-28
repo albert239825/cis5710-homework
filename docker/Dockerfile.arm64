@@ -6,7 +6,7 @@ FROM ubuntu:22.04 AS base
 #LABEL build_type=base
 
 RUN apt-get update
-RUN apt-get install --yes sudo git zip tmux emacs time
+RUN apt-get install --yes sudo git zip tmux vim time
 RUN apt-get install --yes gcc-riscv64-unknown-elf device-tree-compiler
 
 # NB: Docker automagically extracts a local (not remote) tarball passed to the ADD command
@@ -43,6 +43,10 @@ RUN make
 # Create a non-root user named `penn` with sudo privileges, and switch to them
 RUN useradd -m -s /bin/bash penn && echo 'penn ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers.d/penn
 USER penn
+
+# Set editor to vim
+ENV EDITOR=vim
+ENV VISUAL=vim
 
 # install Yosys OSS CAD Suite
 # brings verilator, cocotb, nextpnr-ecp5, yosys, openFPGALoader
