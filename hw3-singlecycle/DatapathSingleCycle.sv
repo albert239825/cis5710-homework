@@ -28,7 +28,19 @@ module RegFile (
   localparam int NumRegs = 32;
   logic [`REG_SIZE] regs[NumRegs];
 
-  // TODO: your code here
+  // READS — combinational, instant, no clock needed
+  assign rs1_data = (rs1 == 5'd0) ? 32'd0 : regs[rs1];
+  assign rs2_data = (rs2 == 5'd0) ? 32'd0 : regs[rs2];
+
+  // WRITES — synchronous, happen on clock edge
+  always_ff @(posedge clk) begin
+    if (rst) begin
+      for (int i = 0; i < NumRegs; i = i + 1)
+        regs[i] <= 32'd0;
+    end else if (we && rd != 5'd0) begin
+      regs[rd] <= rd_data;
+    end
+  end
 
 endmodule
 
@@ -201,18 +213,43 @@ module DatapathSingleCycle (
   // TODO: you will need to edit the port connections, however.
   wire [`REG_SIZE] rs1_data;
   wire [`REG_SIZE] rs2_data;
+  logic [`REG_SIZE] rd_data;
+  logic we;
+
   RegFile rf (
     .clk(clk),
     .rst(rst),
-    .we(1'b0),
-    .rd(0),
-    .rd_data(0),
-    .rs1(0),
-    .rs2(0),
+    .we(we),
+    .rd(insn_rd),
+    .rd_data(rd_data),
+    .rs1(insn_rs1),
+    .rs2(insn_rs2),
     .rs1_data(rs1_data),
     .rs2_data(rs2_data));
 
   logic illegal_insn;
+
+  // ALU infrastructure
+  logic [`REG_SIZE] alu_result;
+  logic [`REG_SIZE] alu_op1, alu_op2;
+
+  // CLA (Carry Lookahead Adder) instantiation
+  logic [`REG_SIZE] cla_sum;
+  logic cla_cin;
+  logic [`REG_SIZE] cla_b;
+  CarryLookaheadAdder cla (
+    .a(alu_op1),
+    .b(cla_b),
+    .cin(cla_cin),
+    .sum(cla_sum)
+  );
+
+  // Branch condition flag
+  logic branch_taken;
+
+  // Signed comparison helpers
+  wire signed [`REG_SIZE] rs1_signed = $signed(rs1_data);
+  wire signed [`REG_SIZE] rs2_signed = $signed(rs2_data);
 
   always_comb begin
     illegal_insn = 1'b0;
