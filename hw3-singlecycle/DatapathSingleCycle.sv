@@ -253,6 +253,9 @@ module DatapathSingleCycle (
   wire signed [`REG_SIZE] rs1_signed = $signed(rs1_data);
   wire signed [`REG_SIZE] rs2_signed = $signed(rs2_data);
 
+  // multiplier infrastructure
+  logic [63:0] product;
+
   always_comb begin
     illegal_insn = 1'b0;
     we = 1'b0;
@@ -265,6 +268,7 @@ module DatapathSingleCycle (
     branch_taken = 1'b0;
     halt = 1'b0;
     pcNext = pcCurrent + 4;  // default: increment PC
+    product = 64'd0;
 
     // memory outputs
     addr_to_dmem = 32'd0;
@@ -279,7 +283,8 @@ module DatapathSingleCycle (
 
       // HW3B: rd = PC + (imm20 << 12). Similar to lui but adds the PC.
       OpAuipc: begin
-        // TODO: implement auipc
+        rd_data = pcCurrent + {insn_from_imem[31:12], 12'd0};
+        we = 1'b1;
       end
 
       OpRegImm: begin
@@ -349,13 +354,16 @@ module DatapathSingleCycle (
         end else if (insn_and) begin
           rd_data = rs1_data & rs2_data;
         end else if (insn_mul) begin
-          // TODO: mul — 32-bit product (use *). Lower 32 bits.
+          rd_data = rs1_data * rs2_data;
         end else if (insn_mulh) begin
-          // TODO: mulh — signed × signed, upper 32 bits of 64-bit product.
+          product = {{32{rs1_data[31]}}, rs1_data} * {{32{rs2_data[31]}}, rs2_data};
+          rd_data = product[63:32];
         end else if (insn_mulhsu) begin
-          // TODO: mulhsu — signed × unsigned, upper 32 bits of 64-bit product.
+          product = {{32{rs1_data[31]}}, rs1_data} * {32'd0, rs2_data};
+          rd_data = product[63:32];
         end else if (insn_mulhu) begin
-          // TODO: mulhu — unsigned × unsigned, upper 32 bits of 64-bit product.
+          product = {32'd0, rs1_data} * {32'd0, rs2_data};
+          rd_data = product[63:32];
         end else if (insn_div) begin
           // TODO: div — signed divide. Use DividerUnsigned; take abs, divide, fix sign.
         end else if (insn_divu) begin
