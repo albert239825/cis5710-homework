@@ -256,6 +256,17 @@ module DatapathSingleCycle (
   // multiplier infrastructure
   logic [63:0] product;
 
+  // Divider infrastructure
+  logic [`REG_SIZE] div_dividend, div_divisor;
+  wire [`REG_SIZE] div_quotient, div_remainder;
+
+  DividerUnsigned divider (
+      .i_dividend (div_dividend),
+      .i_divisor  (div_divisor),
+      .o_quotient (div_quotient),
+      .o_remainder(div_remainder)
+  );
+
   always_comb begin
     illegal_insn = 1'b0;
     we = 1'b0;
@@ -269,6 +280,8 @@ module DatapathSingleCycle (
     halt = 1'b0;
     pcNext = pcCurrent + 4;  // default: increment PC
     product = 64'd0;
+    div_dividend = 32'd0;
+    div_divisor = 32'd0;
 
     // memory outputs
     addr_to_dmem = 32'd0;
@@ -365,13 +378,21 @@ module DatapathSingleCycle (
           product = {32'd0, rs1_data} * {32'd0, rs2_data};
           rd_data = product[63:32];
         end else if (insn_div) begin
-          // TODO: div — signed divide. Use DividerUnsigned; take abs, divide, fix sign.
+          div_dividend = rs1_data[31] ? (~rs1_data + 1) : rs1_data;
+          div_divisor = rs2_data[31] ? (~rs2_data + 1) : rs2_data;
+          rd_data = (rs1_data[31] ^ rs2_data[31]) ? (~div_quotient + 1) : div_quotient;
         end else if (insn_divu) begin
-          // TODO: divu — unsigned divide. Use DividerUnsigned.
+          div_dividend = rs1_data;
+          div_divisor = rs2_data;
+          rd_data = div_quotient;
         end else if (insn_rem) begin
-          // TODO: rem — signed remainder. Use DividerUnsigned; take abs, divide, fix sign.
+          div_dividend = rs1_data[31] ? (~rs1_data + 1) : rs1_data;
+          div_divisor = rs2_data[31] ? (~rs2_data + 1) : rs2_data;
+          rd_data = rs1_data[31] ? (~div_remainder + 1) : div_remainder;
         end else if (insn_remu) begin
-          // TODO: remu — unsigned remainder. Use DividerUnsigned.
+          div_dividend = rs1_data;
+          div_divisor = rs2_data;
+          rd_data = (rs2_data == 0) ? rs1_data : div_remainder;
         end else begin
           illegal_insn = 1'b1;
           we = 1'b0;
@@ -403,14 +424,16 @@ module DatapathSingleCycle (
         end
       end
 
-      // HW3B: rd = PC+4; PC = PC + sign_ext(offset). Jump and link.
       OpJal: begin
-        // TODO: implement jal — write PC+4 to rd, set pcNext = pcCurrent + imm_j_sext
+        rd_data = pcCurrent + 4;
+        pcNext = pcCurrent + imm_j_sext;
+        we = 1'b1;
       end
 
-      // HW3B: rd = PC+4; PC = (rs1 + sign_ext(imm12)) & ~1. Jump to register+offset.
       OpJalr: begin
-        // TODO: implement jalr — write PC+4 to rd, set pcNext = (rs1_data + imm_i_sext) & ~1
+        rd_data = pcCurrent + 4;
+        pcNext = (rs1_data + imm_i_sext) & 32'hFFFFFFFE;
+        we = 1'b1;
       end
 
       // HW3B: Loads — address = rs1 + sign_ext(imm12); drive addr_to_dmem; extract bytes from load_data_from_dmem by byte lane (addr[1:0]); sign- or zero-extend.
