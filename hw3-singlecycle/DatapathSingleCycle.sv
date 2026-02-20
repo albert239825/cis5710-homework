@@ -253,6 +253,16 @@ module DatapathSingleCycle (
 
   always_comb begin
     illegal_insn = 1'b0;
+    we = 1'b0;
+    rd_data = 32'd0;
+    alu_result = 32'd0;
+    alu_op1 = rs1_data;
+    alu_op2 = rs2_data;
+    cla_b = rs2_data;
+    cla_cin = 1'b0;
+    branch_taken = 1'b0;
+    halt = 1'b0;
+    pcNext = pcCurrent + 4; // default: increment PC
 
     case (insn_opcode)
       OpLui: begin
