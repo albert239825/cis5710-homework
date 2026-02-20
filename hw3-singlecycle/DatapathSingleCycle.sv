@@ -277,6 +277,11 @@ module DatapathSingleCycle (
         we = 1'b1;
       end
 
+      // HW3B: rd = PC + (imm20 << 12). Similar to lui but adds the PC.
+      OpAuipc: begin
+        // TODO: implement auipc
+      end
+
       OpRegImm: begin
         // immediate ALU operations
         we = 1'b1;
@@ -343,16 +348,95 @@ module DatapathSingleCycle (
           rd_data = rs1_data | rs2_data;
         end else if (insn_and) begin
           rd_data = rs1_data & rs2_data;
+        end else if (insn_mul) begin
+          // TODO: mul — 32-bit product (use *). Lower 32 bits.
+        end else if (insn_mulh) begin
+          // TODO: mulh — signed × signed, upper 32 bits of 64-bit product.
+        end else if (insn_mulhsu) begin
+          // TODO: mulhsu — signed × unsigned, upper 32 bits of 64-bit product.
+        end else if (insn_mulhu) begin
+          // TODO: mulhu — unsigned × unsigned, upper 32 bits of 64-bit product.
+        end else if (insn_div) begin
+          // TODO: div — signed divide. Use DividerUnsigned; take abs, divide, fix sign.
+        end else if (insn_divu) begin
+          // TODO: divu — unsigned divide. Use DividerUnsigned.
+        end else if (insn_rem) begin
+          // TODO: rem — signed remainder. Use DividerUnsigned; take abs, divide, fix sign.
+        end else if (insn_remu) begin
+          // TODO: remu — unsigned remainder. Use DividerUnsigned.
         end else begin
           illegal_insn = 1'b1;
           we = 1'b0;
         end
       end
+
+      OpBranch: begin
+        // branch instructions
+        we = 1'b0;
+
+        if (insn_beq) begin
+          branch_taken = (rs1_data == rs2_data);
+        end else if (insn_bne) begin
+          branch_taken = (rs1_data != rs2_data);
+        end else if (insn_blt) begin
+          branch_taken = (rs1_signed < rs2_signed);
+        end else if (insn_bge) begin
+          branch_taken = (rs1_signed >= rs2_signed);
+        end else if (insn_bltu) begin
+          branch_taken = (rs1_data < rs2_data);
+        end else if (insn_bgeu) begin
+          branch_taken = (rs1_data >= rs2_data);
+        end else begin
+          illegal_insn = 1'b1;
+        end
+
+        if (branch_taken) begin
+          pcNext = pcCurrent + imm_b_sext;
+        end
+      end
+
+      // HW3B: rd = PC+4; PC = PC + sign_ext(offset). Jump and link.
+      OpJal: begin
+        // TODO: implement jal — write PC+4 to rd, set pcNext = pcCurrent + imm_j_sext
+      end
+
+      // HW3B: rd = PC+4; PC = (rs1 + sign_ext(imm12)) & ~1. Jump to register+offset.
+      OpJalr: begin
+        // TODO: implement jalr — write PC+4 to rd, set pcNext = (rs1_data + imm_i_sext) & ~1
+      end
+
+      // HW3B: Loads — address = rs1 + sign_ext(imm12); drive addr_to_dmem; extract bytes from load_data_from_dmem by byte lane (addr[1:0]); sign- or zero-extend.
+      OpLoad: begin
+        // TODO: lb, lh, lw, lbu, lhu — compute address, set addr_to_dmem, set rd_data from load_data_from_dmem (byte/half/word, sign/zero extend)
+      end
+
+      // HW3B: Stores — address = rs1 + sign_ext(imm12); put rs2 on store_data_to_dmem; set store_we_to_dmem by size and byte lane (addr[1:0]).
+      OpStore: begin
+        // TODO: sb, sh, sw — compute address, set addr_to_dmem, store_data_to_dmem, store_we_to_dmem
+      end
+
+      // HW3B: Treat as no-op; default pcNext = pcCurrent + 4 already does this.
+      OpMiscMem: begin
+        // TODO: fence — no-op (ensure we don't set illegal_insn; default PC+4 is correct)
+      end
+
+      OpEnviron: begin
+        if (insn_ecall) begin
+          halt = 1'b1;
+        end else begin
+          illegal_insn = 1'b1;
+        end
+      end
+
       default: begin
         illegal_insn = 1'b1;
       end
     endcase
   end
+
+  assign trace_completed_pc = pcCurrent;
+  assign trace_completed_insn = insn_from_imem;
+  assign trace_completed_cycle_status = CYCLE_NO_STALL;
 
 endmodule
 
