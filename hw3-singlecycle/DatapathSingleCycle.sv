@@ -267,6 +267,10 @@ module DatapathSingleCycle (
       .o_remainder(div_remainder)
   );
 
+  // Memory address computation for loads and stores
+  wire [31:0] addr_load = rs1_data + imm_i_sext;
+  wire [31:0] addr_store = rs1_data + imm_s_sext;
+
   always_comb begin
     illegal_insn = 1'b0;
     we = 1'b0;
@@ -378,9 +382,15 @@ module DatapathSingleCycle (
           product = {32'd0, rs1_data} * {32'd0, rs2_data};
           rd_data = product[63:32];
         end else if (insn_div) begin
-          div_dividend = rs1_data[31] ? (~rs1_data + 1) : rs1_data;
-          div_divisor = rs2_data[31] ? (~rs2_data + 1) : rs2_data;
-          rd_data = (rs1_data[31] ^ rs2_data[31]) ? (~div_quotient + 1) : div_quotient;
+          if (rs2_data == 32'd0) begin
+            rd_data = 32'hFFFFFFFF;
+          end else if (rs1_data == 32'h80000000 && rs2_data == 32'hFFFFFFFF) begin
+            rd_data = 32'h80000000;
+          end else begin
+            div_dividend = rs1_data[31] ? (~rs1_data + 1) : rs1_data;
+            div_divisor = rs2_data[31] ? (~rs2_data + 1) : rs2_data;
+            rd_data = (rs1_data[31] ^ rs2_data[31]) ? (~div_quotient + 1) : div_quotient;
+          end
         end else if (insn_divu) begin
           div_dividend = rs1_data;
           div_divisor = rs2_data;
@@ -436,19 +446,89 @@ module DatapathSingleCycle (
         we = 1'b1;
       end
 
-      // HW3B: Loads — address = rs1 + sign_ext(imm12); drive addr_to_dmem; extract bytes from load_data_from_dmem by byte lane (addr[1:0]); sign- or zero-extend.
       OpLoad: begin
-        // TODO: lb, lh, lw, lbu, lhu — compute address, set addr_to_dmem, set rd_data from load_data_from_dmem (byte/half/word, sign/zero extend)
+        addr_to_dmem = {addr_load[31:2], 2'b00};
+        we = 1'b1;
+        case (insn_funct3)
+          3'b000: begin  // LB
+            case (addr_load[1:0])
+              2'b00: rd_data = {{24{load_data_from_dmem[7]}}, load_data_from_dmem[7:0]};
+              2'b01: rd_data = {{24{load_data_from_dmem[15]}}, load_data_from_dmem[15:8]};
+              2'b10: rd_data = {{24{load_data_from_dmem[23]}}, load_data_from_dmem[23:16]};
+              2'b11: rd_data = {{24{load_data_from_dmem[31]}}, load_data_from_dmem[31:24]};
+            endcase
+          end
+          3'b001: begin  // LH
+            case (addr_load[1:0])
+              2'b00:   rd_data = {{16{load_data_from_dmem[15]}}, load_data_from_dmem[15:0]};
+              2'b10:   rd_data = {{16{load_data_from_dmem[31]}}, load_data_from_dmem[31:16]};
+              default: rd_data = 32'd0;
+            endcase
+          end
+          3'b010: begin  // LW
+            rd_data = load_data_from_dmem;
+          end
+          3'b100: begin  // LBU
+            case (addr_load[1:0])
+              2'b00: rd_data = {24'b0, load_data_from_dmem[7:0]};
+              2'b01: rd_data = {24'b0, load_data_from_dmem[15:8]};
+              2'b10: rd_data = {24'b0, load_data_from_dmem[23:16]};
+              2'b11: rd_data = {24'b0, load_data_from_dmem[31:24]};
+            endcase
+          end
+          3'b101: begin  // LHU
+            case (addr_load[1:0])
+              2'b00:   rd_data = {16'b0, load_data_from_dmem[15:0]};
+              2'b10:   rd_data = {16'b0, load_data_from_dmem[31:16]};
+              default: rd_data = 32'd0;
+            endcase
+          end
+          default: illegal_insn = 1'b1;
+        endcase
       end
 
-      // HW3B: Stores — address = rs1 + sign_ext(imm12); put rs2 on store_data_to_dmem; set store_we_to_dmem by size and byte lane (addr[1:0]).
       OpStore: begin
-        // TODO: sb, sh, sw — compute address, set addr_to_dmem, store_data_to_dmem, store_we_to_dmem
-      end
-
-      // HW3B: Treat as no-op; default pcNext = pcCurrent + 4 already does this.
-      OpMiscMem: begin
-        // TODO: fence — no-op (ensure we don't set illegal_insn; default PC+4 is correct)
+        addr_to_dmem = {addr_store[31:2], 2'b00};
+        case (insn_funct3)
+          3'b000: begin  // SB
+            case (addr_store[1:0])
+              2'b00: begin
+                store_data_to_dmem = {24'b0, rs2_data[7:0]};
+                store_we_to_dmem   = 4'b0001;
+              end
+              2'b01: begin
+                store_data_to_dmem = {16'b0, rs2_data[7:0], 8'b0};
+                store_we_to_dmem   = 4'b0010;
+              end
+              2'b10: begin
+                store_data_to_dmem = {8'b0, rs2_data[7:0], 16'b0};
+                store_we_to_dmem   = 4'b0100;
+              end
+              2'b11: begin
+                store_data_to_dmem = {rs2_data[7:0], 24'b0};
+                store_we_to_dmem   = 4'b1000;
+              end
+            endcase
+          end
+          3'b001: begin  // SH
+            case (addr_store[1:0])
+              2'b00: begin
+                store_data_to_dmem = {16'b0, rs2_data[15:0]};
+                store_we_to_dmem   = 4'b0011;
+              end
+              2'b10: begin
+                store_data_to_dmem = {rs2_data[15:0], 16'b0};
+                store_we_to_dmem   = 4'b1100;
+              end
+              default: ;
+            endcase
+          end
+          3'b010: begin  // SW
+            store_data_to_dmem = rs2_data;
+            store_we_to_dmem   = 4'b1111;
+          end
+          default: illegal_insn = 1'b1;
+        endcase
       end
 
       OpEnviron: begin
