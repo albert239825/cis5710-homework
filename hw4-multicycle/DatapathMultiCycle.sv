@@ -28,27 +28,45 @@ module RegFile (
     input logic rst
 );
 
-  // TODO: copy your HW3B code here
+  localparam int NumRegs = 32;
+  logic [`REG_SIZE] regs[NumRegs];
+
+  // READS — combinational, instant, no clock needed
+  assign rs1_data = (rs1 == 5'd0) ? 32'd0 : regs[rs1];
+  assign rs2_data = (rs2 == 5'd0) ? 32'd0 : regs[rs2];
+
+  // WRITES — synchronous, happen on clock edge
+  always_ff @(posedge clk) begin
+    if (rst) begin
+      for (int i = 0; i < NumRegs; i = i + 1) regs[i] <= 32'd0;
+    end else if (we && rd != 5'd0) begin
+      regs[rd] <= rd_data;
+    end
+  end
 
 endmodule
 
 module DatapathMultiCycle (
-    input wire                clk,
-    input wire                rst,
-    output logic              halt,
-    output logic [`REG_SIZE]  pc_to_imem,
-    input wire [`INSN_SIZE]   insn_from_imem,
+    input  wire                        clk,
+    input  wire                        rst,
+    output logic                       halt,
+    output logic          [ `REG_SIZE] pc_to_imem,
+    input  wire           [`INSN_SIZE] insn_from_imem,
     // addr_to_dmem is a read-write port
-    output logic [`REG_SIZE]  addr_to_dmem,
-    input wire [`REG_SIZE]    load_data_from_dmem,
-    output logic [`REG_SIZE]  store_data_to_dmem,
-    output logic [3:0]        store_we_to_dmem,
-    output logic [`REG_SIZE]  trace_completed_pc,
-    output logic [`INSN_SIZE] trace_completed_insn,
-    output cycle_status_e     trace_completed_cycle_status
+    output logic          [ `REG_SIZE] addr_to_dmem,
+    input  wire           [ `REG_SIZE] load_data_from_dmem,
+    output logic          [ `REG_SIZE] store_data_to_dmem,
+    output logic          [       3:0] store_we_to_dmem,
+    output logic          [ `REG_SIZE] trace_completed_pc,
+    output logic          [`INSN_SIZE] trace_completed_insn,
+    output cycle_status_e              trace_completed_cycle_status
 );
 
   // TODO: your code here (largely based on HW3B)
+  // replace divider with pipelined divider
+  // add divide cycle counter to track how many cycles since last divide operation
+  // add stall logic while waiting for divide to complete
+  // modify div/divu/rem/remu instructions to only read the output on final cycle
   // components of the instruction
   wire [6:0] insn_funct7;
   wire [4:0] insn_rs2;
@@ -158,7 +176,7 @@ module DatapathMultiCycle (
 
   // this code is only for simulation, not synthesis
 `ifndef SYNTHESIS
-  `include "RvDisassembler.sv"
+  `include "../hw3-singlecycle/RvDisassembler.sv"
   string disasm_string;
   always_comb begin
     disasm_string = rv_disasm(insn_from_imem);
@@ -290,6 +308,9 @@ module DatapathMultiCycle (
     addr_to_dmem = 32'd0;
     store_data_to_dmem = 32'd0;
     store_we_to_dmem = 4'd0;
+
+    // trace outputs
+    trace_completed_cycle_status = CYCLE_NO_STALL;
 
     case (insn_opcode)
       OpLui: begin
@@ -542,12 +563,21 @@ module DatapathMultiCycle (
         illegal_insn = 1'b1;
       end
     endcase
+
+    // handle divide instructions
+    if (is_div_insn) begin
+      if (divide_cycle_counter != 3'd7) begin
+        // divide is in progress, stall
+        rd_data = 32'd0;
+        we = 1'b0;
+        pcNext = pcCurrent;
+        trace_completed_cycle_status = CYCLE_DIV;
+      end
+    end
   end
 
   assign trace_completed_pc = pcCurrent;
   assign trace_completed_insn = insn_from_imem;
-  assign trace_completed_cycle_status = CYCLE_NO_STALL;
-
 endmodule
 
 module MemorySingleCycle #(
@@ -639,13 +669,13 @@ prepare register/PC updates, which occur at @posedge clock_proc.
  mem:  ___|    |___
 */
 module Processor (
-    input wire               clock_proc,
-    input wire               clock_mem,
-    input wire               rst,
-    output wire [`REG_SIZE]  trace_completed_pc,
-    output wire [`INSN_SIZE] trace_completed_insn,
-    output cycle_status_e    trace_completed_cycle_status, 
-    output logic             halt
+    input  wire                        clock_proc,
+    input  wire                        clock_mem,
+    input  wire                        rst,
+    output wire           [ `REG_SIZE] trace_completed_pc,
+    output wire           [`INSN_SIZE] trace_completed_insn,
+    output cycle_status_e              trace_completed_cycle_status,
+    output logic                       halt
 );
 
   wire [`REG_SIZE] pc_to_imem, mem_data_addr, mem_data_loaded_value, mem_data_to_write;
@@ -659,16 +689,16 @@ module Processor (
   MemorySingleCycle #(
       .NUM_WORDS(8192)
   ) memory (
-      .rst      (rst),
-      .clock_mem (clock_mem),
+      .rst                (rst),
+      .clock_mem          (clock_mem),
       // imem is read-only
-      .pc_to_imem(pc_to_imem),
-      .insn_from_imem(insn_from_imem),
+      .pc_to_imem         (pc_to_imem),
+      .insn_from_imem     (insn_from_imem),
       // dmem is read-write
-      .addr_to_dmem(mem_data_addr),
+      .addr_to_dmem       (mem_data_addr),
       .load_data_from_dmem(mem_data_loaded_value),
       .store_data_to_dmem (mem_data_to_write),
-      .store_we_to_dmem  (mem_data_we)
+      .store_we_to_dmem   (mem_data_we)
   );
 
   DatapathMultiCycle datapath (
