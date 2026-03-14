@@ -100,8 +100,8 @@ module DividerUnsignedPipelined (
         end
     end
 
-    assign o_remainder = remainder_pipe[7];
-    assign o_quotient  = quotient_pipe[7];
+    assign o_remainder = remainder_next[7];
+    assign o_quotient  = quotient_next[7];
 
 endmodule
 
