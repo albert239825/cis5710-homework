@@ -246,11 +246,24 @@ module DatapathMultiCycle (
   logic [`REG_SIZE] div_dividend, div_divisor;
   wire [`REG_SIZE] div_quotient, div_remainder;
 
-  DividerUnsigned divider (
+  logic [2:0] divide_cycle_counter;
+  wire is_div_insn = insn_div || insn_divu || insn_rem || insn_remu;
+  always_ff @(posedge clk) begin
+    if (rst) begin
+      divide_cycle_counter <= 3'd0;
+    end else if (is_div_insn) begin
+      divide_cycle_counter <= divide_cycle_counter + 1;
+    end
+  end
+
+  DividerUnsignedPipelined divider (
+      .clk(clk),
+      .rst(rst),
+      .stall(1'b0),
       .i_dividend (div_dividend),
       .i_divisor  (div_divisor),
-      .o_quotient (div_quotient),
-      .o_remainder(div_remainder)
+      .o_remainder(div_remainder),
+      .o_quotient (div_quotient)
   );
 
   // Memory address computation for loads and stores
