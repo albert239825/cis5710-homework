@@ -264,12 +264,18 @@ module DatapathMultiCycle (
   logic [`REG_SIZE] div_dividend, div_divisor;
   wire [`REG_SIZE] div_quotient, div_remainder;
 
-  logic [2:0] divide_cycle_counter;
+  logic [3:0] divide_cycle_counter;
   wire is_div_insn = insn_div || insn_divu || insn_rem || insn_remu;
   always_ff @(posedge clk) begin
     if (rst) begin
-      divide_cycle_counter <= 3'd0;
-    end else if (is_div_insn) begin
+      divide_cycle_counter <= 4'd0;
+    end else if (!is_div_insn) begin
+      // reset so the next div instruction always starts counting from 0
+      divide_cycle_counter <= 4'd0;
+    end else if (divide_cycle_counter == 4'd8) begin
+      // committed this cycle; reset for a potential back-to-back div
+      divide_cycle_counter <= 4'd0;
+    end else begin
       divide_cycle_counter <= divide_cycle_counter + 1;
     end
   end
@@ -566,7 +572,7 @@ module DatapathMultiCycle (
 
     // handle divide instructions
     if (is_div_insn) begin
-      if (divide_cycle_counter != 3'd7) begin
+      if (divide_cycle_counter != 4'd8) begin
         // divide is in progress, stall
         rd_data = 32'd0;
         we = 1'b0;
