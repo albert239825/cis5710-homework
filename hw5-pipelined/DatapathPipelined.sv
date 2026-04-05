@@ -167,6 +167,9 @@ module DatapathPipelined (
     end else if (d_load_use_stall) begin
       // freeze during load-use hazard
       decode_state <= decode_state;
+    end else if (x_div_stall_upstream) begin
+      // freeze while divider is running and Decode can't overlap
+      decode_state <= decode_state;
     end else begin
       decode_state <= '{pc: f_pc_current, insn: f_insn, cycle_status: f_cycle_status};
     end
@@ -323,6 +326,9 @@ module DatapathPipelined (
           imm_j_sext: 0,
           imm_shamt: 0
       };
+    end else if (x_div_stall_upstream) begin
+      // hold div/rem in Execute while divider pipeline runs (no overlap)
+      execute_state <= execute_state;
     end else begin
       execute_state <= '{
           pc: decode_state.pc,
@@ -392,6 +398,102 @@ module DatapathPipelined (
 
   // 64-bit product for M-extension mulh* instructions
   logic [63:0] x_mul_full;
+
+  // divider pipeline infrastructure for div/divu/rem/remu
+  logic [3:0] x_div_counter;
+  wire x_is_div = (execute_state.insn_opcode == OpcodeRegReg) &&
+                  (execute_state.insn_funct7 == 7'd1) &&
+                  (execute_state.insn_funct3[2] == 1'b1);
+  wire x_div_stall = x_is_div && (x_div_counter < 4'd7);
+  wire x_start_div = x_is_div && (x_div_counter == 4'd0);
+
+  // Decode-side: is the instruction in Decode also a div/rem?
+  wire d_is_div = (d_insn_opcode == OpcodeRegReg) &&
+                  (d_insn_funct7 == 7'd1) &&
+                  (d_insn_funct3[2] == 1'b1) &&
+                  (decode_state.cycle_status != CYCLE_RESET) &&
+                  (decode_state.cycle_status != CYCLE_TAKEN_BRANCH);
+  wire d_div_no_dependency =
+      (execute_state.insn_rd == 5'd0) ||
+      ((execute_state.insn_rd != d_insn_rs1) &&
+       (execute_state.insn_rd != d_insn_rs2));
+  // Independent div in Decode can overlap: don't stall it
+  wire d_div_can_overlap = d_is_div && d_div_no_dependency && x_div_stall;
+
+  // Stall Fetch/Decode only when div is in-flight AND Decode can't overlap
+  wire x_div_stall_upstream = x_div_stall && !d_div_can_overlap;
+
+  logic [`REG_SIZE] div_dividend, div_divisor;
+  wire [`REG_SIZE] div_quotient, div_remainder;
+
+  DividerUnsignedPipelined divider (
+      .clk(clk),
+      .rst(rst),
+      .stall(1'b0),
+      .i_dividend (div_dividend),
+      .i_divisor  (div_divisor),
+      .o_remainder(div_remainder),
+      .o_quotient (div_quotient)
+  );
+
+  // Saved operand metadata — captured on the first cycle of each div
+  logic [`REG_SIZE] div_saved_rs1, div_saved_rs2;
+  logic             div_saved_sign_q, div_saved_sign_r;
+  logic             div_saved_is_rem;
+
+  always_ff @(posedge clk) begin
+    if (rst) begin
+      x_div_counter    <= 4'd0;
+      div_saved_rs1    <= 0;
+      div_saved_rs2    <= 0;
+      div_saved_sign_q <= 0;
+      div_saved_sign_r <= 0;
+      div_saved_is_rem <= 0;
+    end else if (d_div_can_overlap) begin
+      // An independent div in Decode is about to replace us in Execute;
+      // reset counter so the new div starts at cycle 0 next clock edge.
+      x_div_counter <= 4'd0;
+    end else if (x_is_div && x_div_counter < 4'd8) begin
+      x_div_counter <= x_div_counter + 4'd1;
+      if (x_div_counter == 4'd0) begin
+        div_saved_rs1    <= x_rs1_data;
+        div_saved_rs2    <= x_rs2_data;
+        div_saved_sign_q <= !execute_state.insn_funct3[0] &&
+                            (x_rs1_data[31] ^ x_rs2_data[31]);
+        div_saved_sign_r <= !execute_state.insn_funct3[0] && x_rs1_data[31];
+        div_saved_is_rem <= execute_state.insn_funct3[1];
+      end
+    end else begin
+      x_div_counter <= 4'd0;
+    end
+  end
+
+  // Feed divider only on the start cycle (cycle 0); zeros otherwise are harmless
+  always_comb begin
+    if (x_start_div) begin
+      div_dividend = (!execute_state.insn_funct3[0] && x_rs1_data[31])
+                     ? (~x_rs1_data + 32'd1) : x_rs1_data;
+      div_divisor  = (!execute_state.insn_funct3[0] && x_rs2_data[31])
+                     ? (~x_rs2_data + 32'd1) : x_rs2_data;
+    end else begin
+      div_dividend = 32'd0;
+      div_divisor  = 32'd0;
+    end
+  end
+
+  // Compute final div/rem result from saved metadata + divider output
+  wire div_by_zero  = (div_saved_rs2 == 32'd0);
+  wire div_overflow = div_saved_sign_q &&
+                      (div_saved_rs1 == 32'h8000_0000) &&
+                      (div_saved_rs2 == 32'hFFFF_FFFF);
+  wire [`REG_SIZE] div_corrected_q = div_saved_sign_q
+                                     ? (~div_quotient + 32'd1) : div_quotient;
+  wire [`REG_SIZE] div_corrected_r = div_saved_sign_r
+                                     ? (~div_remainder + 32'd1) : div_remainder;
+  wire [`REG_SIZE] div_final =
+      div_by_zero  ? (div_saved_is_rem ? div_saved_rs1 : 32'hFFFF_FFFF) :
+      div_overflow ? (div_saved_is_rem ? 32'd0 : 32'h8000_0000) :
+      div_saved_is_rem ? div_corrected_r : div_corrected_q;
 
   always_comb begin
     x_alu_result    = 32'd0;
@@ -496,6 +598,9 @@ module DatapathPipelined (
               x_mul_full = {32'd0, x_rs1_data} * {32'd0, x_rs2_data};
               x_alu_result = x_mul_full[63:32];
             end
+            3'b100, 3'b101, 3'b110, 3'b111: begin // div, divu, rem, remu
+              x_alu_result = div_final;
+            end
             default: x_we = 1'b0;
           endcase
         end
@@ -576,6 +681,9 @@ module DatapathPipelined (
     end else if (d_load_use_stall) begin
       f_pc_current   <= f_pc_current;  // freeze during load-use hazard
       f_cycle_status <= CYCLE_NO_STALL;
+    end else if (x_div_stall_upstream) begin
+      f_pc_current   <= f_pc_current;  // freeze while divider is running (no overlap)
+      f_cycle_status <= CYCLE_NO_STALL;
     end else begin
       f_pc_current   <= f_pc_current + 4;
       f_cycle_status <= CYCLE_NO_STALL;
@@ -604,6 +712,19 @@ module DatapathPipelined (
           pc: 0,
           insn: 0,
           cycle_status: CYCLE_RESET,
+          insn_rd: 0,
+          insn_rs2: 0,
+          insn_opcode: 0,
+          insn_funct3: 0,
+          alu_result: 0,
+          rs2_data: 0,
+          we: 0
+      };
+    end else if (x_div_stall) begin
+      memory_state <= '{
+          pc: 0,
+          insn: 0,
+          cycle_status: CYCLE_DIV,
           insn_rd: 0,
           insn_rs2: 0,
           insn_opcode: 0,
