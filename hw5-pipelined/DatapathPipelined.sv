@@ -164,6 +164,9 @@ module DatapathPipelined (
     // if branch is taken, flush the decode stage
     end else if (x_flush) begin
       decode_state <= '{pc: 0, insn: 0, cycle_status: CYCLE_TAKEN_BRANCH};
+    end else if (d_load_use_stall) begin
+      // freeze during load-use hazard
+      decode_state <= decode_state;
     end else begin
       decode_state <= '{pc: f_pc_current, insn: f_insn, cycle_status: f_cycle_status};
     end
@@ -185,6 +188,15 @@ module DatapathPipelined (
   wire [ 2:0] d_insn_funct3 = decode_state.insn[14:12];
   wire [ 4:0] d_insn_rd = decode_state.insn[11:7];
   wire [ 6:0] d_insn_opcode = decode_state.insn[6:0];
+
+  // load use stall
+  wire d_load_use_stall =
+  (execute_state.insn_opcode == OpcodeLoad) &&
+  (execute_state.cycle_status != CYCLE_RESET) &&
+  (execute_state.cycle_status != CYCLE_TAKEN_BRANCH) &&
+  (execute_state.insn_rd != 5'd0) &&
+  ((execute_state.insn_rd == d_insn_rs1) ||
+   (execute_state.insn_rd == d_insn_rs2));
 
   // Immediate generation in decode
   wire [11:0] d_imm_i = decode_state.insn[31:20];
@@ -278,6 +290,25 @@ module DatapathPipelined (
           pc: 0,
           insn: 0,
           cycle_status: CYCLE_TAKEN_BRANCH,
+          insn_rs1: 0,
+          insn_rs2: 0,
+          insn_rd: 0,
+          insn_opcode: 0,
+          insn_funct7: 0,
+          insn_funct3: 0,
+          rs1_data: 0,
+          rs2_data: 0,
+          imm_i_sext: 0,
+          imm_s_sext: 0,
+          imm_b_sext: 0,
+          imm_j_sext: 0,
+          imm_shamt: 0
+      };
+    end else if (d_load_use_stall) begin
+      execute_state <= '{
+          pc: 0,
+          insn: 0,
+          cycle_status: CYCLE_LOAD2USE,
           insn_rs1: 0,
           insn_rs2: 0,
           insn_rd: 0,
@@ -542,6 +573,9 @@ module DatapathPipelined (
       // branch taken: next fetch from branch target
       f_pc_current   <= x_branch_target;
       f_cycle_status <= CYCLE_NO_STALL;
+    end else if (d_load_use_stall) begin
+      f_pc_current   <= f_pc_current;  // freeze during load-use hazard
+      f_cycle_status <= CYCLE_NO_STALL;
     end else begin
       f_pc_current   <= f_pc_current + 4;
       f_cycle_status <= CYCLE_NO_STALL;
@@ -607,6 +641,10 @@ module DatapathPipelined (
   assign m_alu_result = memory_state.alu_result;
   assign m_we         = memory_state.we;
 
+  // WM bypass: if W writes the same reg as the store's rs2, use W's value (M's rs2_data is stale).
+  wire [`REG_SIZE] m_rs2_data_bypassed =
+      (w_we && w_rd != 5'd0 && w_rd == memory_state.insn_rs2) ? w_rd_data : memory_state.rs2_data;
+
   // memory stage: handle loads/stores
   logic [`REG_SIZE] m_load_data;
 
@@ -623,19 +661,19 @@ module DatapathPipelined (
         3'b000: begin  // sb
           case (memory_state.alu_result[1:0])
             2'b00: begin
-              store_data_to_dmem = {24'b0, memory_state.rs2_data[7:0]};
+              store_data_to_dmem = {24'b0, m_rs2_data_bypassed[7:0]};
               store_we_to_dmem   = 4'b0001;
             end
             2'b01: begin
-              store_data_to_dmem = {16'b0, memory_state.rs2_data[7:0], 8'b0};
+              store_data_to_dmem = {16'b0, m_rs2_data_bypassed[7:0], 8'b0};
               store_we_to_dmem   = 4'b0010;
             end
             2'b10: begin
-              store_data_to_dmem = {8'b0, memory_state.rs2_data[7:0], 16'b0};
+              store_data_to_dmem = {8'b0, m_rs2_data_bypassed[7:0], 16'b0};
               store_we_to_dmem   = 4'b0100;
             end
             2'b11: begin
-              store_data_to_dmem = {memory_state.rs2_data[7:0], 24'b0};
+              store_data_to_dmem = {m_rs2_data_bypassed[7:0], 24'b0};
               store_we_to_dmem   = 4'b1000;
             end
             default: ;
@@ -644,18 +682,18 @@ module DatapathPipelined (
         3'b001: begin  // sh
           case (memory_state.alu_result[1:0])
             2'b00: begin
-              store_data_to_dmem = {16'b0, memory_state.rs2_data[15:0]};
+              store_data_to_dmem = {16'b0, m_rs2_data_bypassed[15:0]};
               store_we_to_dmem   = 4'b0011;
             end
             2'b10: begin
-              store_data_to_dmem = {memory_state.rs2_data[15:0], 16'b0};
+              store_data_to_dmem = {m_rs2_data_bypassed[15:0], 16'b0};
               store_we_to_dmem   = 4'b1100;
             end
             default: ;
           endcase
         end
         3'b010: begin  // sw
-          store_data_to_dmem = memory_state.rs2_data;
+          store_data_to_dmem = m_rs2_data_bypassed;
           store_we_to_dmem   = 4'b1111;
         end
         default: ;
