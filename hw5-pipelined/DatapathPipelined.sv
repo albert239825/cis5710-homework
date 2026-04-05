@@ -168,7 +168,7 @@ module DatapathPipelined (
       // freeze during load-use hazard
       decode_state <= decode_state;
     end else if (x_div_stall_upstream) begin
-      // freeze while divider is running and Decode can't overlap
+      // freeze while divider is running
       decode_state <= decode_state;
     end else begin
       decode_state <= '{pc: f_pc_current, insn: f_insn, cycle_status: f_cycle_status};
@@ -327,7 +327,7 @@ module DatapathPipelined (
           imm_shamt: 0
       };
     end else if (x_div_stall_upstream) begin
-      // hold div/rem in Execute while divider pipeline runs (no overlap)
+      // hold div/rem in Execute while divider pipeline runs
       execute_state <= execute_state;
     end else begin
       execute_state <= '{
@@ -417,11 +417,12 @@ module DatapathPipelined (
       (execute_state.insn_rd == 5'd0) ||
       ((execute_state.insn_rd != d_insn_rs1) &&
        (execute_state.insn_rd != d_insn_rs2));
-  // Independent div in Decode can overlap: don't stall it
-  wire d_div_can_overlap = d_is_div && d_div_no_dependency && x_div_stall;
+  // Feed an independent Decode div one cycle after current Execute div starts.
+  wire d_div_overlap_feed = x_is_div && (x_div_counter == 4'd1) &&
+                            d_is_div && d_div_no_dependency;
 
-  // Stall Fetch/Decode only when div is in-flight AND Decode can't overlap
-  wire x_div_stall_upstream = x_div_stall && !d_div_can_overlap;
+  // Always stall Fetch/Decode while Execute div/rem is in-flight.
+  wire x_div_stall_upstream = x_div_stall;
 
   logic [`REG_SIZE] div_dividend, div_divisor;
   wire [`REG_SIZE] div_quotient, div_remainder;
@@ -440,6 +441,10 @@ module DatapathPipelined (
   logic [`REG_SIZE] div_saved_rs1, div_saved_rs2;
   logic             div_saved_sign_q, div_saved_sign_r;
   logic             div_saved_is_rem;
+  logic             div_overlap_pending;
+  logic [`REG_SIZE] div_overlap_saved_rs1, div_overlap_saved_rs2;
+  logic             div_overlap_saved_sign_q, div_overlap_saved_sign_r;
+  logic             div_overlap_saved_is_rem;
 
   always_ff @(posedge clk) begin
     if (rst) begin
@@ -449,12 +454,30 @@ module DatapathPipelined (
       div_saved_sign_q <= 0;
       div_saved_sign_r <= 0;
       div_saved_is_rem <= 0;
-    end else if (d_div_can_overlap) begin
-      // An independent div in Decode is about to replace us in Execute;
-      // reset counter so the new div starts at cycle 0 next clock edge.
+      div_overlap_pending <= 1'b0;
+      div_overlap_saved_rs1 <= 0;
+      div_overlap_saved_rs2 <= 0;
+      div_overlap_saved_sign_q <= 1'b0;
+      div_overlap_saved_sign_r <= 1'b0;
+      div_overlap_saved_is_rem <= 1'b0;
+    end else if (x_flush) begin
       x_div_counter <= 4'd0;
+      div_overlap_pending <= 1'b0;
     end else if (x_is_div && x_div_counter < 4'd8) begin
-      x_div_counter <= x_div_counter + 4'd1;
+      if ((x_div_counter == 4'd7) && div_overlap_pending) begin
+        // The overlapped Decode div is entering Execute now.
+        // It was fed at counter==1, so its divider result is now ready.
+        x_div_counter <= 4'd7;
+        div_saved_rs1    <= div_overlap_saved_rs1;
+        div_saved_rs2    <= div_overlap_saved_rs2;
+        div_saved_sign_q <= div_overlap_saved_sign_q;
+        div_saved_sign_r <= div_overlap_saved_sign_r;
+        div_saved_is_rem <= div_overlap_saved_is_rem;
+        div_overlap_pending <= 1'b0;
+      end else begin
+        x_div_counter <= x_div_counter + 4'd1;
+      end
+
       if (x_div_counter == 4'd0) begin
         div_saved_rs1    <= x_rs1_data;
         div_saved_rs2    <= x_rs2_data;
@@ -463,18 +486,34 @@ module DatapathPipelined (
         div_saved_sign_r <= !execute_state.insn_funct3[0] && x_rs1_data[31];
         div_saved_is_rem <= execute_state.insn_funct3[1];
       end
+
+      if (d_div_overlap_feed && !div_overlap_pending) begin
+        div_overlap_pending <= 1'b1;
+        div_overlap_saved_rs1 <= d_rs1_data;
+        div_overlap_saved_rs2 <= d_rs2_data;
+        div_overlap_saved_sign_q <= !d_insn_funct3[0] &&
+                                    (d_rs1_data[31] ^ d_rs2_data[31]);
+        div_overlap_saved_sign_r <= !d_insn_funct3[0] && d_rs1_data[31];
+        div_overlap_saved_is_rem <= d_insn_funct3[1];
+      end
     end else begin
       x_div_counter <= 4'd0;
+      div_overlap_pending <= 1'b0;
     end
   end
 
-  // Feed divider only on the start cycle (cycle 0); zeros otherwise are harmless
+  // Feed divider on Execute start cycle, or one cycle later from Decode for overlap.
   always_comb begin
     if (x_start_div) begin
       div_dividend = (!execute_state.insn_funct3[0] && x_rs1_data[31])
                      ? (~x_rs1_data + 32'd1) : x_rs1_data;
       div_divisor  = (!execute_state.insn_funct3[0] && x_rs2_data[31])
                      ? (~x_rs2_data + 32'd1) : x_rs2_data;
+    end else if (d_div_overlap_feed && !div_overlap_pending) begin
+      div_dividend = (!d_insn_funct3[0] && d_rs1_data[31])
+                     ? (~d_rs1_data + 32'd1) : d_rs1_data;
+      div_divisor  = (!d_insn_funct3[0] && d_rs2_data[31])
+                     ? (~d_rs2_data + 32'd1) : d_rs2_data;
     end else begin
       div_dividend = 32'd0;
       div_divisor  = 32'd0;
@@ -682,7 +721,7 @@ module DatapathPipelined (
       f_pc_current   <= f_pc_current;  // freeze during load-use hazard
       f_cycle_status <= CYCLE_NO_STALL;
     end else if (x_div_stall_upstream) begin
-      f_pc_current   <= f_pc_current;  // freeze while divider is running (no overlap)
+      f_pc_current   <= f_pc_current;  // freeze while divider is running
       f_cycle_status <= CYCLE_NO_STALL;
     end else begin
       f_pc_current   <= f_pc_current + 4;
