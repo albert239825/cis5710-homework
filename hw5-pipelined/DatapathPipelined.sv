@@ -96,11 +96,11 @@ module DatapathPipelined (
     output logic halt,
 
     // The PC of the insn currently in Writeback. 0 if not a valid insn.
-    output logic [`REG_SIZE] trace_writeback_pc,
+    output logic [`REG_SIZE] trace_completed_pc,
     // The bits of the insn currently in Writeback. 0 if not a valid insn.
-    output logic [`INSN_SIZE] trace_writeback_insn,
+    output logic [`INSN_SIZE] trace_completed_insn,
     // The status of the insn (or stall) currently in Writeback. See the cycle_status.sv file for valid values.
-    output cycle_status_e trace_writeback_cycle_status
+    output cycle_status_e trace_completed_cycle_status
 );
 
   // opcodes - see section 19 of RiscV spec
@@ -1010,15 +1010,9 @@ module DatapathPipelined (
                 (writeback_state.insn[31:7] == 25'd0) &&
                 (writeback_state.cycle_status == CYCLE_NO_STALL);
 
-  assign trace_writeback_pc = writeback_state.pc;
-  assign trace_writeback_insn = writeback_state.insn;
-  assign trace_writeback_cycle_status = writeback_state.cycle_status;
-
-  // Aliases used by cocotb testbench via Verilator --public-flat-rw
-  wire [`REG_SIZE] trace_completed_pc = trace_writeback_pc;
-  wire [`INSN_SIZE] trace_completed_insn = trace_writeback_insn;
-  cycle_status_e trace_completed_cycle_status;
-  assign trace_completed_cycle_status = trace_writeback_cycle_status;
+  assign trace_completed_pc = writeback_state.pc;
+  assign trace_completed_insn = writeback_state.insn;
+  assign trace_completed_cycle_status = writeback_state.cycle_status;
 
 endmodule
 
@@ -1140,9 +1134,9 @@ module Processor (
       .store_we_to_dmem(mem_data_we),
       .load_data_from_dmem(mem_data_loaded_value),
       .halt(halt),
-      .trace_writeback_pc(trace_completed_pc),
-      .trace_writeback_insn(trace_completed_insn),
-      .trace_writeback_cycle_status(trace_completed_cycle_status)
+      .trace_completed_pc(trace_completed_pc),
+      .trace_completed_insn(trace_completed_insn),
+      .trace_completed_cycle_status(trace_completed_cycle_status)
   );
 
 endmodule
