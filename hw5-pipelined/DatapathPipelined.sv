@@ -161,7 +161,7 @@ module DatapathPipelined (
   always_ff @(posedge clk) begin
     if (rst) begin
       decode_state <= '{pc: 0, insn: 0, cycle_status: CYCLE_RESET};
-    // if branch is taken, flush the decode stage
+      // if branch is taken, flush the decode stage
     end else if (x_flush) begin
       decode_state <= '{pc: 0, insn: 0, cycle_status: CYCLE_TAKEN_BRANCH};
     end else if (d_load_use_stall) begin
@@ -185,25 +185,26 @@ module DatapathPipelined (
   /* decode stage */
 
   // instruction fields from decode stage
-  wire [ 6:0] d_insn_funct7 = decode_state.insn[31:25];
-  wire [ 4:0] d_insn_rs2 = decode_state.insn[24:20];
-  wire [ 4:0] d_insn_rs1 = decode_state.insn[19:15];
-  wire [ 2:0] d_insn_funct3 = decode_state.insn[14:12];
-  wire [ 4:0] d_insn_rd = decode_state.insn[11:7];
-  wire [ 6:0] d_insn_opcode = decode_state.insn[6:0];
+  wire [6:0] d_insn_funct7 = decode_state.insn[31:25];
+  wire [4:0] d_insn_rs2 = decode_state.insn[24:20];
+  wire [4:0] d_insn_rs1 = decode_state.insn[19:15];
+  wire [2:0] d_insn_funct3 = decode_state.insn[14:12];
+  wire [4:0] d_insn_rd = decode_state.insn[11:7];
+  wire [6:0] d_insn_opcode = decode_state.insn[6:0];
 
   // load use stall
+  wire d_uses_rs2 = (d_insn_opcode == OpcodeRegReg) || (d_insn_opcode == OpcodeBranch);
   wire d_load_use_stall =
   (execute_state.insn_opcode == OpcodeLoad) &&
   (execute_state.cycle_status != CYCLE_RESET) &&
   (execute_state.cycle_status != CYCLE_TAKEN_BRANCH) &&
   (execute_state.insn_rd != 5'd0) &&
   ((execute_state.insn_rd == d_insn_rs1) ||
-   (execute_state.insn_rd == d_insn_rs2));
+   (d_uses_rs2 && execute_state.insn_rd == d_insn_rs2));
 
   // Immediate generation in decode
   wire [11:0] d_imm_i = decode_state.insn[31:20];
-  wire [ 4:0] d_imm_shamt = decode_state.insn[24:20];
+  wire [4:0] d_imm_shamt = decode_state.insn[24:20];
   wire [11:0] d_imm_s;
   assign d_imm_s[11:5] = d_insn_funct7;
   assign d_imm_s[4:0]  = d_insn_rd;
@@ -326,9 +327,27 @@ module DatapathPipelined (
           imm_j_sext: 0,
           imm_shamt: 0
       };
-    end else if (x_div_stall_upstream) begin
-      // hold div/rem in Execute while divider pipeline runs
+    end else if (x_div_stall) begin
       execute_state <= execute_state;
+    end else if (x_div_retire_overlap) begin
+      execute_state <= '{
+          pc: ov_pc[ov_head],
+          insn: ov_insn[ov_head],
+          cycle_status: CYCLE_NO_STALL,
+          insn_rs1: 0,
+          insn_rs2: 0,
+          insn_rd: ov_rd[ov_head],
+          insn_opcode: OpcodeRegReg,
+          insn_funct7: 7'd1,
+          insn_funct3: ov_insn[ov_head][14:12],
+          rs1_data: 0,
+          rs2_data: 0,
+          imm_i_sext: 0,
+          imm_s_sext: 0,
+          imm_b_sext: 0,
+          imm_j_sext: 0,
+          imm_shamt: 0
+      };
     end else begin
       execute_state <= '{
           pc: decode_state.pc,
@@ -404,6 +423,7 @@ module DatapathPipelined (
   wire x_is_div = (execute_state.insn_opcode == OpcodeRegReg) &&
                   (execute_state.insn_funct7 == 7'd1) &&
                   (execute_state.insn_funct3[2] == 1'b1);
+  // x_div_stall: true when div result is NOT yet ready → Memory gets CYCLE_DIV bubble
   wire x_div_stall = x_is_div && (x_div_counter < 4'd7);
   wire x_start_div = x_is_div && (x_div_counter == 4'd0);
 
@@ -417,12 +437,17 @@ module DatapathPipelined (
       (execute_state.insn_rd == 5'd0) ||
       ((execute_state.insn_rd != d_insn_rs1) &&
        (execute_state.insn_rd != d_insn_rs2));
-  // Feed an independent Decode div one cycle after current Execute div starts.
-  wire d_div_overlap_feed = x_is_div && (x_div_counter == 4'd1) &&
-                            d_is_div && d_div_no_dependency;
+  // Feed an independent Decode div into the divider pipeline at counter cycles 1-7.
+  // At counter 7, only feed if not already in retirement phase (div_retiring).
+  logic div_retiring;
+  wire d_div_can_feed = x_is_div && 
+                        ((x_div_counter >= 4'd1 && x_div_counter <= 4'd6) ||
+                         (x_div_counter == 4'd7 && !div_retiring)) &&
+                        d_is_div && d_div_no_dependency;
 
-  // Always stall Fetch/Decode while Execute div/rem is in-flight.
-  wire x_div_stall_upstream = x_div_stall;
+  // Stall Fetch/Decode while divider runs, EXCEPT when actively feeding a new independent div
+  // (in which case we let the pipeline advance by one so the next div enters Decode).
+  wire x_div_stall_upstream = x_div_stall && !d_div_can_feed;
 
   logic [`REG_SIZE] div_dividend, div_divisor;
   wire [`REG_SIZE] div_quotient, div_remainder;
@@ -431,20 +456,32 @@ module DatapathPipelined (
       .clk(clk),
       .rst(rst),
       .stall(1'b0),
-      .i_dividend (div_dividend),
-      .i_divisor  (div_divisor),
+      .i_dividend(div_dividend),
+      .i_divisor(div_divisor),
       .o_remainder(div_remainder),
-      .o_quotient (div_quotient)
+      .o_quotient(div_quotient)
   );
 
-  // Saved operand metadata — captured on the first cycle of each div
+  // Saved metadata for the div currently in Execute (captured at counter==0)
   logic [`REG_SIZE] div_saved_rs1, div_saved_rs2;
-  logic             div_saved_sign_q, div_saved_sign_r;
-  logic             div_saved_is_rem;
-  logic             div_overlap_pending;
-  logic [`REG_SIZE] div_overlap_saved_rs1, div_overlap_saved_rs2;
-  logic             div_overlap_saved_sign_q, div_overlap_saved_sign_r;
-  logic             div_overlap_saved_is_rem;
+  logic div_saved_sign_q, div_saved_sign_r;
+  logic div_saved_is_rem;
+
+  // Circular buffer of overlapped independent divs fed at counter 1..7.
+  localparam int DIV_OVERLAP_MAX = 8;  // power of 2 for easy wrapping
+  logic [ `REG_SIZE] ov_rs1   [DIV_OVERLAP_MAX];
+  logic [ `REG_SIZE] ov_rs2   [DIV_OVERLAP_MAX];
+  logic              ov_sign_q[DIV_OVERLAP_MAX];
+  logic              ov_sign_r[DIV_OVERLAP_MAX];
+  logic              ov_is_rem[DIV_OVERLAP_MAX];
+  logic [       4:0] ov_rd    [DIV_OVERLAP_MAX];
+  logic [ `REG_SIZE] ov_pc    [DIV_OVERLAP_MAX];
+  logic [`INSN_SIZE] ov_insn  [DIV_OVERLAP_MAX];
+  logic [2:0] ov_head, ov_tail;  // head=dequeue, tail=enqueue
+
+  wire div_overlap_pending = (ov_head != ov_tail);
+
+  wire x_div_retire_overlap = x_is_div && (x_div_counter == 4'd7) && div_overlap_pending;
 
   always_ff @(posedge clk) begin
     if (rst) begin
@@ -454,30 +491,37 @@ module DatapathPipelined (
       div_saved_sign_q <= 0;
       div_saved_sign_r <= 0;
       div_saved_is_rem <= 0;
-      div_overlap_pending <= 1'b0;
-      div_overlap_saved_rs1 <= 0;
-      div_overlap_saved_rs2 <= 0;
-      div_overlap_saved_sign_q <= 1'b0;
-      div_overlap_saved_sign_r <= 1'b0;
-      div_overlap_saved_is_rem <= 1'b0;
+      ov_head          <= 3'd0;
+      ov_tail          <= 3'd0;
+      div_retiring     <= 1'b0;
     end else if (x_flush) begin
       x_div_counter <= 4'd0;
-      div_overlap_pending <= 1'b0;
+      ov_head       <= 3'd0;
+      ov_tail       <= 3'd0;
+      div_retiring  <= 1'b0;
     end else if (x_is_div && x_div_counter < 4'd8) begin
-      if ((x_div_counter == 4'd7) && div_overlap_pending) begin
-        // The overlapped Decode div is entering Execute now.
-        // It was fed at counter==1, so its divider result is now ready.
-        x_div_counter <= 4'd7;
-        div_saved_rs1    <= div_overlap_saved_rs1;
-        div_saved_rs2    <= div_overlap_saved_rs2;
-        div_saved_sign_q <= div_overlap_saved_sign_q;
-        div_saved_sign_r <= div_overlap_saved_sign_r;
-        div_saved_is_rem <= div_overlap_saved_is_rem;
-        div_overlap_pending <= 1'b0;
+      // counter advancement
+      if (x_div_retire_overlap) begin
+        x_div_counter    <= 4'd7;
+        div_retiring     <= 1'b1;
+        // Promote head entry as the new saved metadata
+        div_saved_rs1    <= ov_rs1[ov_head];
+        div_saved_rs2    <= ov_rs2[ov_head];
+        div_saved_sign_q <= ov_sign_q[ov_head];
+        div_saved_sign_r <= ov_sign_r[ov_head];
+        div_saved_is_rem <= ov_is_rem[ov_head];
+        // Advance head pointer (dequeue)
+        ov_head          <= ov_head + 3'd1;
+      end else if (x_div_counter == 4'd7) begin
+        x_div_counter <= 4'd0;
+        ov_head       <= 3'd0;
+        ov_tail       <= 3'd0;
+        div_retiring  <= 1'b0;
       end else begin
         x_div_counter <= x_div_counter + 4'd1;
       end
 
+      // Capture Execute div metadata on its first cycle
       if (x_div_counter == 4'd0) begin
         div_saved_rs1    <= x_rs1_data;
         div_saved_rs2    <= x_rs2_data;
@@ -487,33 +531,35 @@ module DatapathPipelined (
         div_saved_is_rem <= execute_state.insn_funct3[1];
       end
 
-      if (d_div_overlap_feed && !div_overlap_pending) begin
-        div_overlap_pending <= 1'b1;
-        div_overlap_saved_rs1 <= d_rs1_data;
-        div_overlap_saved_rs2 <= d_rs2_data;
-        div_overlap_saved_sign_q <= !d_insn_funct3[0] &&
-                                    (d_rs1_data[31] ^ d_rs2_data[31]);
-        div_overlap_saved_sign_r <= !d_insn_funct3[0] && d_rs1_data[31];
-        div_overlap_saved_is_rem <= d_insn_funct3[1];
+      if (d_div_can_feed) begin
+        ov_rs1[ov_tail]    <= d_rs1_data;
+        ov_rs2[ov_tail]    <= d_rs2_data;
+        ov_sign_q[ov_tail] <= !d_insn_funct3[0] && (d_rs1_data[31] ^ d_rs2_data[31]);
+        ov_sign_r[ov_tail] <= !d_insn_funct3[0] && d_rs1_data[31];
+        ov_is_rem[ov_tail] <= d_insn_funct3[1];
+        ov_rd[ov_tail]     <= d_insn_rd;
+        ov_pc[ov_tail]     <= decode_state.pc;
+        ov_insn[ov_tail]   <= decode_state.insn;
+        ov_tail            <= ov_tail + 3'd1;
       end
     end else begin
       x_div_counter <= 4'd0;
-      div_overlap_pending <= 1'b0;
+      ov_head       <= 3'd0;
+      ov_tail       <= 3'd0;
+      div_retiring  <= 1'b0;
     end
   end
 
-  // Feed divider on Execute start cycle, or one cycle later from Decode for overlap.
+  // Feed divider: counter==0 feeds Execute div; counter 1-7 feeds next independent Decode div.
   always_comb begin
     if (x_start_div) begin
       div_dividend = (!execute_state.insn_funct3[0] && x_rs1_data[31])
                      ? (~x_rs1_data + 32'd1) : x_rs1_data;
       div_divisor  = (!execute_state.insn_funct3[0] && x_rs2_data[31])
                      ? (~x_rs2_data + 32'd1) : x_rs2_data;
-    end else if (d_div_overlap_feed && !div_overlap_pending) begin
-      div_dividend = (!d_insn_funct3[0] && d_rs1_data[31])
-                     ? (~d_rs1_data + 32'd1) : d_rs1_data;
-      div_divisor  = (!d_insn_funct3[0] && d_rs2_data[31])
-                     ? (~d_rs2_data + 32'd1) : d_rs2_data;
+    end else if (d_div_can_feed) begin
+      div_dividend = (!d_insn_funct3[0] && d_rs1_data[31]) ? (~d_rs1_data + 32'd1) : d_rs1_data;
+      div_divisor  = (!d_insn_funct3[0] && d_rs2_data[31]) ? (~d_rs2_data + 32'd1) : d_rs2_data;
     end else begin
       div_dividend = 32'd0;
       div_divisor  = 32'd0;
@@ -521,14 +567,12 @@ module DatapathPipelined (
   end
 
   // Compute final div/rem result from saved metadata + divider output
-  wire div_by_zero  = (div_saved_rs2 == 32'd0);
+  wire div_by_zero = (div_saved_rs2 == 32'd0);
   wire div_overflow = div_saved_sign_q &&
                       (div_saved_rs1 == 32'h8000_0000) &&
                       (div_saved_rs2 == 32'hFFFF_FFFF);
-  wire [`REG_SIZE] div_corrected_q = div_saved_sign_q
-                                     ? (~div_quotient + 32'd1) : div_quotient;
-  wire [`REG_SIZE] div_corrected_r = div_saved_sign_r
-                                     ? (~div_remainder + 32'd1) : div_remainder;
+  wire [`REG_SIZE] div_corrected_q = div_saved_sign_q ? (~div_quotient + 32'd1) : div_quotient;
+  wire [`REG_SIZE] div_corrected_r = div_saved_sign_r ? (~div_remainder + 32'd1) : div_remainder;
   wire [`REG_SIZE] div_final =
       div_by_zero  ? (div_saved_is_rem ? div_saved_rs1 : 32'hFFFF_FFFF) :
       div_overflow ? (div_saved_is_rem ? 32'd0 : 32'h8000_0000) :
@@ -630,14 +674,14 @@ module DatapathPipelined (
               x_alu_result = x_mul_full[63:32];
             end
             3'b010: begin  // mulhsu (signed * unsigned, upper 32 bits)
-              x_mul_full = {{32{x_rs1_data[31]}}, x_rs1_data} * {32'd0, x_rs2_data};
+              x_mul_full   = {{32{x_rs1_data[31]}}, x_rs1_data} * {32'd0, x_rs2_data};
               x_alu_result = x_mul_full[63:32];
             end
             3'b011: begin  // mulhu (unsigned * unsigned, upper 32 bits)
-              x_mul_full = {32'd0, x_rs1_data} * {32'd0, x_rs2_data};
+              x_mul_full   = {32'd0, x_rs1_data} * {32'd0, x_rs2_data};
               x_alu_result = x_mul_full[63:32];
             end
-            3'b100, 3'b101, 3'b110, 3'b111: begin // div, divu, rem, remu
+            3'b100, 3'b101, 3'b110, 3'b111: begin  // div, divu, rem, remu
               x_alu_result = div_final;
             end
             default: x_we = 1'b0;
