@@ -9,10 +9,9 @@
       ]
     }
   },
-
   // allow ssh agent for using host machine ssh keys
   "mounts": [
-    // Mount keys (read-only)
-    "type=bind,source=${localEnv:HOME}/.ssh,target=/home/penn/.ssh,readonly"
+    // Mount keys (read-only) - target must match the user running in the container (root)
+    "type=bind,source=${localEnv:HOME}/.ssh,target=/root/.ssh,readonly"
   ]
 }
