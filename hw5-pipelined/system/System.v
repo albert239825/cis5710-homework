@@ -413,9 +413,9 @@ module DatapathPipelined (
 	store_data_to_dmem,
 	store_we_to_dmem,
 	halt,
-	trace_writeback_pc,
-	trace_writeback_insn,
-	trace_writeback_cycle_status
+	trace_completed_pc,
+	trace_completed_insn,
+	trace_completed_cycle_status
 );
 	reg _sv2v_0;
 	input wire clk;
@@ -427,9 +427,9 @@ module DatapathPipelined (
 	output reg [31:0] store_data_to_dmem;
 	output reg [3:0] store_we_to_dmem;
 	output wire halt;
-	output wire [31:0] trace_writeback_pc;
-	output wire [31:0] trace_writeback_insn;
-	output wire [31:0] trace_writeback_cycle_status;
+	output wire [31:0] trace_completed_pc;
+	output wire [31:0] trace_completed_insn;
+	output wire [31:0] trace_completed_cycle_status;
 	localparam [6:0] OpcodeLoad = 7'b0000011;
 	localparam [6:0] OpcodeStore = 7'b0100011;
 	localparam [6:0] OpcodeBranch = 7'b1100011;
@@ -460,12 +460,20 @@ module DatapathPipelined (
 	reg [95:0] decode_state;
 	wire [4:0] d_insn_rs1 = decode_state[51:47];
 	wire [4:0] d_insn_rs2 = decode_state[56:52];
+	wire [6:0] d_insn_opcode = decode_state[38:32];
+	wire d_uses_rs2 = (d_insn_opcode == OpcodeRegReg) || (d_insn_opcode == OpcodeBranch);
 	reg [324:0] execute_state;
-	wire d_load_use_stall = ((((execute_state[213-:7] == OpcodeLoad) && (execute_state[260-:32] != 32'd4)) && (execute_state[260-:32] != 32'd8)) && (execute_state[218-:5] != 5'd0)) && ((execute_state[218-:5] == d_insn_rs1) || (execute_state[218-:5] == d_insn_rs2));
+	wire d_load_use_stall = ((((execute_state[213-:7] == OpcodeLoad) && (execute_state[260-:32] != 32'd4)) && (execute_state[260-:32] != 32'd8)) && (execute_state[218-:5] != 5'd0)) && ((execute_state[218-:5] == d_insn_rs1) || (d_uses_rs2 && (execute_state[218-:5] == d_insn_rs2)));
+	wire d_div_no_dependency = (execute_state[218-:5] == 5'd0) || ((execute_state[218-:5] != d_insn_rs1) && (execute_state[218-:5] != d_insn_rs2));
+	wire [2:0] d_insn_funct3 = decode_state[46:44];
+	wire [6:0] d_insn_funct7 = decode_state[63:57];
+	wire d_is_div = ((((d_insn_opcode == OpcodeRegReg) && (d_insn_funct7 == 7'd1)) && (d_insn_funct3[2] == 1'b1)) && (decode_state[31-:32] != 32'd4)) && (decode_state[31-:32] != 32'd8);
+	reg div_retiring;
 	reg [3:0] x_div_counter;
 	wire x_is_div = ((execute_state[213-:7] == OpcodeRegReg) && (execute_state[206-:7] == 7'd1)) && (execute_state[199] == 1'b1);
+	wire d_div_can_feed = ((x_is_div && (((x_div_counter >= 4'd1) && (x_div_counter <= 4'd6)) || ((x_div_counter == 4'd7) && !div_retiring))) && d_is_div) && d_div_no_dependency;
 	wire x_div_stall = x_is_div && (x_div_counter < 4'd7);
-	wire x_div_stall_upstream = x_div_stall;
+	wire x_div_stall_upstream = x_div_stall && !d_div_can_feed;
 	reg x_branch_taken;
 	wire x_flush = (x_branch_taken && (execute_state[260-:32] != 32'd4)) && (((execute_state[213-:7] == OpcodeBranch) || (execute_state[213-:7] == OpcodeJal)) || (execute_state[213-:7] == OpcodeJalr));
 	always @(posedge clk)
@@ -484,10 +492,7 @@ module DatapathPipelined (
 		.insn(decode_state[63-:32]),
 		.disasm(d_disasm)
 	);
-	wire [6:0] d_insn_funct7 = decode_state[63:57];
-	wire [2:0] d_insn_funct3 = decode_state[46:44];
 	wire [4:0] d_insn_rd = decode_state[43:39];
-	wire [6:0] d_insn_opcode = decode_state[38:32];
 	wire [11:0] d_imm_i = decode_state[63:52];
 	wire [4:0] d_imm_shamt = decode_state[56:52];
 	wire [11:0] d_imm_s;
@@ -521,6 +526,14 @@ module DatapathPipelined (
 	);
 	wire [31:0] d_rs1_data = ((w_we && (w_rd != 5'd0)) && (w_rd == d_insn_rs1) ? w_rd_data : d_rs1_data_rf);
 	wire [31:0] d_rs2_data = ((w_we && (w_rd != 5'd0)) && (w_rd == d_insn_rs2) ? w_rd_data : d_rs2_data_rf);
+	reg [2:0] ov_head;
+	localparam signed [31:0] DIV_OVERLAP_MAX = 8;
+	reg [31:0] ov_insn [0:7];
+	reg [31:0] ov_pc [0:7];
+	reg [4:0] ov_rd [0:7];
+	reg [2:0] ov_tail;
+	wire div_overlap_pending = ov_head != ov_tail;
+	wire x_div_retire_overlap = (x_is_div && (x_div_counter == 4'd7)) && div_overlap_pending;
 	function automatic [31:0] sv2v_cast_32;
 		input reg [31:0] inp;
 		sv2v_cast_32 = inp;
@@ -532,8 +545,10 @@ module DatapathPipelined (
 			execute_state <= 325'h10000000000000000000000000000000000000000000000000000000000;
 		else if (d_load_use_stall)
 			execute_state <= 325'h20000000000000000000000000000000000000000000000000000000000;
-		else if (x_div_stall_upstream)
+		else if (x_div_stall)
 			execute_state <= execute_state;
+		else if (x_div_retire_overlap)
+			execute_state <= {ov_pc[ov_head], ov_insn[ov_head], 42'h00000000400, ov_rd[ov_head], OpcodeRegReg, 7'd1, ov_insn[ov_head][14:12], 197'h00000000000000000000000000000000000000000000000000};
 		else
 			execute_state <= {sv2v_cast_32(decode_state[95-:32]), sv2v_cast_32(decode_state[63-:32]), sv2v_cast_32(decode_state[31-:32]), d_insn_rs1, d_insn_rs2, d_insn_rd, d_insn_opcode, d_insn_funct7, d_insn_funct3, d_rs1_data, d_rs2_data, d_imm_i_sext, d_imm_s_sext, d_imm_b_sext, d_imm_j_sext, d_imm_shamt};
 	wire [255:0] x_disasm;
@@ -562,9 +577,6 @@ module DatapathPipelined (
 	);
 	reg [63:0] x_mul_full;
 	wire x_start_div = x_is_div && (x_div_counter == 4'd0);
-	wire d_is_div = ((((d_insn_opcode == OpcodeRegReg) && (d_insn_funct7 == 7'd1)) && (d_insn_funct3[2] == 1'b1)) && (decode_state[31-:32] != 32'd4)) && (decode_state[31-:32] != 32'd8);
-	wire d_div_no_dependency = (execute_state[218-:5] == 5'd0) || ((execute_state[218-:5] != d_insn_rs1) && (execute_state[218-:5] != d_insn_rs2));
-	wire d_div_overlap_feed = ((x_is_div && (x_div_counter == 4'd1)) && d_is_div) && d_div_no_dependency;
 	reg [31:0] div_dividend;
 	reg [31:0] div_divisor;
 	wire [31:0] div_quotient;
@@ -583,12 +595,11 @@ module DatapathPipelined (
 	reg div_saved_sign_q;
 	reg div_saved_sign_r;
 	reg div_saved_is_rem;
-	reg div_overlap_pending;
-	reg [31:0] div_overlap_saved_rs1;
-	reg [31:0] div_overlap_saved_rs2;
-	reg div_overlap_saved_sign_q;
-	reg div_overlap_saved_sign_r;
-	reg div_overlap_saved_is_rem;
+	reg [31:0] ov_rs1 [0:7];
+	reg [31:0] ov_rs2 [0:7];
+	reg ov_sign_q [0:7];
+	reg ov_sign_r [0:7];
+	reg ov_is_rem [0:7];
 	always @(posedge clk)
 		if (rst) begin
 			x_div_counter <= 4'd0;
@@ -597,26 +608,32 @@ module DatapathPipelined (
 			div_saved_sign_q <= 0;
 			div_saved_sign_r <= 0;
 			div_saved_is_rem <= 0;
-			div_overlap_pending <= 1'b0;
-			div_overlap_saved_rs1 <= 0;
-			div_overlap_saved_rs2 <= 0;
-			div_overlap_saved_sign_q <= 1'b0;
-			div_overlap_saved_sign_r <= 1'b0;
-			div_overlap_saved_is_rem <= 1'b0;
+			ov_head <= 3'd0;
+			ov_tail <= 3'd0;
+			div_retiring <= 1'b0;
 		end
 		else if (x_flush) begin
 			x_div_counter <= 4'd0;
-			div_overlap_pending <= 1'b0;
+			ov_head <= 3'd0;
+			ov_tail <= 3'd0;
+			div_retiring <= 1'b0;
 		end
 		else if (x_is_div && (x_div_counter < 4'd8)) begin
-			if ((x_div_counter == 4'd7) && div_overlap_pending) begin
+			if (x_div_retire_overlap) begin
 				x_div_counter <= 4'd7;
-				div_saved_rs1 <= div_overlap_saved_rs1;
-				div_saved_rs2 <= div_overlap_saved_rs2;
-				div_saved_sign_q <= div_overlap_saved_sign_q;
-				div_saved_sign_r <= div_overlap_saved_sign_r;
-				div_saved_is_rem <= div_overlap_saved_is_rem;
-				div_overlap_pending <= 1'b0;
+				div_retiring <= 1'b1;
+				div_saved_rs1 <= ov_rs1[ov_head];
+				div_saved_rs2 <= ov_rs2[ov_head];
+				div_saved_sign_q <= ov_sign_q[ov_head];
+				div_saved_sign_r <= ov_sign_r[ov_head];
+				div_saved_is_rem <= ov_is_rem[ov_head];
+				ov_head <= ov_head + 3'd1;
+			end
+			else if (x_div_counter == 4'd7) begin
+				x_div_counter <= 4'd0;
+				ov_head <= 3'd0;
+				ov_tail <= 3'd0;
+				div_retiring <= 1'b0;
 			end
 			else
 				x_div_counter <= x_div_counter + 4'd1;
@@ -627,18 +644,23 @@ module DatapathPipelined (
 				div_saved_sign_r <= !execute_state[197] && x_rs1_data[31];
 				div_saved_is_rem <= execute_state[198];
 			end
-			if (d_div_overlap_feed && !div_overlap_pending) begin
-				div_overlap_pending <= 1'b1;
-				div_overlap_saved_rs1 <= d_rs1_data;
-				div_overlap_saved_rs2 <= d_rs2_data;
-				div_overlap_saved_sign_q <= !d_insn_funct3[0] && (d_rs1_data[31] ^ d_rs2_data[31]);
-				div_overlap_saved_sign_r <= !d_insn_funct3[0] && d_rs1_data[31];
-				div_overlap_saved_is_rem <= d_insn_funct3[1];
+			if (d_div_can_feed) begin
+				ov_rs1[ov_tail] <= d_rs1_data;
+				ov_rs2[ov_tail] <= d_rs2_data;
+				ov_sign_q[ov_tail] <= !d_insn_funct3[0] && (d_rs1_data[31] ^ d_rs2_data[31]);
+				ov_sign_r[ov_tail] <= !d_insn_funct3[0] && d_rs1_data[31];
+				ov_is_rem[ov_tail] <= d_insn_funct3[1];
+				ov_rd[ov_tail] <= d_insn_rd;
+				ov_pc[ov_tail] <= decode_state[95-:32];
+				ov_insn[ov_tail] <= decode_state[63-:32];
+				ov_tail <= ov_tail + 3'd1;
 			end
 		end
 		else begin
 			x_div_counter <= 4'd0;
-			div_overlap_pending <= 1'b0;
+			ov_head <= 3'd0;
+			ov_tail <= 3'd0;
+			div_retiring <= 1'b0;
 		end
 	always @(*) begin
 		if (_sv2v_0)
@@ -647,7 +669,7 @@ module DatapathPipelined (
 			div_dividend = (!execute_state[197] && x_rs1_data[31] ? ~x_rs1_data + 32'd1 : x_rs1_data);
 			div_divisor = (!execute_state[197] && x_rs2_data[31] ? ~x_rs2_data + 32'd1 : x_rs2_data);
 		end
-		else if (d_div_overlap_feed && !div_overlap_pending) begin
+		else if (d_div_can_feed) begin
 			div_dividend = (!d_insn_funct3[0] && d_rs1_data[31] ? ~d_rs1_data + 32'd1 : d_rs1_data);
 			div_divisor = (!d_insn_funct3[0] && d_rs2_data[31] ? ~d_rs2_data + 32'd1 : d_rs2_data);
 		end
@@ -951,13 +973,9 @@ module DatapathPipelined (
 	assign w_rd_data = writeback_state[32-:32];
 	assign w_we = writeback_state[0];
 	assign halt = ((writeback_state[39-:7] == OpcodeEnviron) && (writeback_state[108:84] == 25'd0)) && (writeback_state[76-:32] == 32'd1);
-	assign trace_writeback_pc = writeback_state[140-:32];
-	assign trace_writeback_insn = writeback_state[108-:32];
-	assign trace_writeback_cycle_status = writeback_state[76-:32];
-	wire [31:0] trace_completed_pc = trace_writeback_pc;
-	wire [31:0] trace_completed_insn = trace_writeback_insn;
-	wire [31:0] trace_completed_cycle_status;
-	assign trace_completed_cycle_status = trace_writeback_cycle_status;
+	assign trace_completed_pc = writeback_state[140-:32];
+	assign trace_completed_insn = writeback_state[108-:32];
+	assign trace_completed_cycle_status = writeback_state[76-:32];
 	initial _sv2v_0 = 0;
 endmodule
 module MemorySingleCycle (
@@ -1008,14 +1026,21 @@ module MemorySingleCycle (
 		end
 	initial _sv2v_0 = 0;
 endmodule
-module SystemResourceCheck (
+module SystemDemo (
 	external_clk_25MHz,
 	btn,
-	led
+	led,
+	gp
 );
 	input wire external_clk_25MHz;
 	input wire [6:0] btn;
 	output wire [7:0] led;
+	output wire [27:0] gp;
+	localparam signed [31:0] MmapGpioStart = 32'hff001000;
+	localparam signed [31:0] LastGpioIndex = 27;
+	localparam signed [31:0] MmapGpioEnd = MmapGpioStart + LastGpioIndex;
+	localparam signed [31:0] MmapLeds = 32'hff002000;
+	localparam signed [31:0] MmapButtons = 32'hff003000;
 	wire clk_proc;
 	wire clk_locked;
 	MyClockGen clock_gen(
@@ -1032,7 +1057,23 @@ module SystemResourceCheck (
 	wire [31:0] trace_writeback_pc;
 	wire [31:0] trace_writeback_insn;
 	wire [31:0] trace_writeback_cycle_status;
-	MemorySingleCycle #(.NUM_WORDS(128)) memory(
+	wire is_gpio_write = (mem_data_we != 0) && ((MmapGpioStart <= mem_data_addr) && (mem_data_addr <= MmapGpioEnd));
+	wire is_led_write = (mem_data_we != 0) && (mem_data_addr == MmapLeds);
+	wire is_button_read = mem_data_addr == MmapButtons;
+	reg [7:0] led_reg;
+	reg [27:0] gpio_reg;
+	always @(posedge clk_proc)
+		if (!clk_locked) begin
+			led_reg <= 0;
+			gpio_reg <= 0;
+		end
+		else if (is_gpio_write)
+			gpio_reg[mem_data_addr - MmapGpioStart] <= mem_data_to_write[0];
+		else if (is_led_write)
+			led_reg <= mem_data_to_write[7:0];
+	assign gp = gpio_reg;
+	assign led = led_reg;
+	MemorySingleCycle #(.NUM_WORDS(1024)) memory(
 		.rst(!clk_locked),
 		.clk(clk_proc),
 		.pc_to_imem(pc_to_imem),
@@ -1040,7 +1081,7 @@ module SystemResourceCheck (
 		.addr_to_dmem(mem_data_addr),
 		.load_data_from_dmem(mem_data_loaded_value),
 		.store_data_to_dmem(mem_data_to_write),
-		.store_we_to_dmem(mem_data_we)
+		.store_we_to_dmem((is_gpio_write ? 4'd0 : mem_data_we))
 	);
 	DatapathPipelined datapath(
 		.clk(clk_proc),
@@ -1051,9 +1092,9 @@ module SystemResourceCheck (
 		.store_data_to_dmem(mem_data_to_write),
 		.store_we_to_dmem(mem_data_we),
 		.load_data_from_dmem(mem_data_loaded_value),
-		.halt(led[0]),
-		.trace_writeback_pc(trace_writeback_pc),
-		.trace_writeback_insn(trace_writeback_insn),
-		.trace_writeback_cycle_status(trace_writeback_cycle_status)
+		.halt(),
+		.trace_completed_pc(trace_writeback_pc),
+		.trace_completed_insn(trace_writeback_insn),
+		.trace_completed_cycle_status(trace_writeback_cycle_status)
 	);
 endmodule
