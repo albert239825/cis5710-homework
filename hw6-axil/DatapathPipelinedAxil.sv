@@ -143,9 +143,9 @@ module DatapathPipelinedAxil (
   cycle_status_e f_cycle_status;
 
   // program counter — updated in Execute stage below when branch is taken
-  // send PC to imem
-  assign pc_to_imem = f_pc_current;
-  assign f_insn = insn_from_imem;
+  // Initial AXIL imem wiring; later steps add handshake-aware fetch control.
+  assign imem.ARADDR = f_pc_current;
+  assign f_insn = imem.RDATA;
 
   // Here's how to disassemble an insn into a string you can view in GtkWave.
   // Use PREFIX to provide a 1-character tag to identify which stage the insn comes from.
@@ -156,6 +156,26 @@ module DatapathPipelinedAxil (
       .insn  (f_insn),
       .disasm(f_disasm)
   );
+
+  /***********/
+  /* G STAGE */
+  /***********/
+
+  typedef enum logic [1:0] {
+    G_EMPTY,
+    G_PENDING,
+    G_HOLDING
+  } g_state_e;
+
+  typedef struct packed {
+    logic [`REG_SIZE]  pc;
+    cycle_status_e     cycle_status;
+    g_state_e          state;
+    logic [`INSN_SIZE] insn_captured;
+    logic              flush_tag;
+  } stage_g_t;
+
+  stage_g_t g_state;
 
   /****************/
   /* DECODE STAGE */
