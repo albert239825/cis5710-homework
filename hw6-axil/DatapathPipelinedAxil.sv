@@ -145,6 +145,12 @@ module DatapathPipelinedAxil (
   // program counter — updated in Execute stage below when branch is taken
   // Initial AXIL imem wiring; later steps add handshake-aware fetch control.
   assign imem.ARADDR = f_pc_current;
+  assign imem.ARPROT = 3'b000;
+  // Don't issue new AR Requests if:
+  // 1. The reset signal is active
+  // 2. The pipeline is flushing
+  // 3. The G stage is not able to accept the request
+  assign imem.ARVALID = !rst && !x_flush && g_can_accept_request;
   assign f_insn = imem.RDATA;
 
   // Here's how to disassemble an insn into a string you can view in GtkWave.
@@ -176,6 +182,36 @@ module DatapathPipelinedAxil (
   } stage_g_t;
 
   stage_g_t g_state;
+
+  always_ff @(posedge clk) begin
+    if (rst) begin
+      g_state <= '{
+          pc: 0,
+          cycle_status: CYCLE_RESET,
+          state: G_EMPTY,
+          insn_captured: 0,
+          flush_tag: 0
+      };
+    end
+  end
+
+  wire g_decode_can_accept = !d_load_use_stall && !x_div_stall_upstream;
+  wire g_can_accept_request = (g_state.state == G_EMPTY) ||
+  // if holding and the decode stage can accept the request, then we can issue
+  // as g will drain to d next cycle and d will be able to accept the request
+  (g_state.state == G_HOLDING && g_decode_can_accept) ||
+  // if waiting for memory and memory will return a response this cycle and
+  // the decode stage can accept the request, then we can issue
+  (g_state.state == G_PENDING && imem.RVALID && g_decode_can_accept);
+
+  wire imem_rready =
+  // if empty, we can always accept the request
+  (g_state.state == G_EMPTY) ||
+  // if pending and memory will return a response this cycle, then we can accept the request
+  (g_state.state == G_PENDING && imem.RVALID) ||
+  // if holding and the decode stage can accept the request, then we can accept the request
+  (g_state.state == G_HOLDING && g_decode_can_accept);
+  assign imem.RREADY = imem_rready;
 
   /****************/
   /* DECODE STAGE */
@@ -777,7 +813,9 @@ module DatapathPipelinedAxil (
                   execute_state.insn_opcode == OpcodeJal    ||
                   execute_state.insn_opcode == OpcodeJalr);
 
-  // update Fetch PC
+  // Update Fetch PC only when the current AR request is accepted.
+  // Load-use/divider/G-full stalls are handled by lowering ARVALID, which prevents
+  // the handshake and naturally holds the PC here.
   always_ff @(posedge clk) begin
     if (rst) begin
       f_pc_current   <= 32'd0;
@@ -786,14 +824,11 @@ module DatapathPipelinedAxil (
       // branch taken: next fetch from branch target
       f_pc_current   <= x_branch_target;
       f_cycle_status <= CYCLE_NO_STALL;
-    end else if (d_load_use_stall) begin
-      f_pc_current   <= f_pc_current;  // freeze during load-use hazard
-      f_cycle_status <= CYCLE_NO_STALL;
-    end else if (x_div_stall_upstream) begin
-      f_pc_current   <= f_pc_current;  // freeze while divider is running
+    end else if (imem.ARVALID && imem.ARREADY) begin
+      f_pc_current   <= f_pc_current + 4;
       f_cycle_status <= CYCLE_NO_STALL;
     end else begin
-      f_pc_current   <= f_pc_current + 4;
+      f_pc_current   <= f_pc_current;
       f_cycle_status <= CYCLE_NO_STALL;
     end
   end
