@@ -106,9 +106,6 @@ module DatapathPipelinedAxil (
     output cycle_status_e trace_completed_cycle_status
 );
 
-  localparam bit True = 1'b1;
-  localparam bit False = 1'b0;
-
   // cycle counter
   logic [`REG_SIZE] cycles_current;
   always_ff @(posedge clk) begin
@@ -133,6 +130,21 @@ module DatapathPipelinedAxil (
 
   localparam bit [`OPCODE_SIZE] OpcodeAuipc = 7'b00_101_11;
   localparam bit [`OPCODE_SIZE] OpcodeLui = 7'b01_101_11;
+
+  logic [`REG_SIZE] x_store_data_to_dmem;
+  logic [3:0] x_store_wstrb_to_dmem;
+
+  assign dmem.ARVALID = !rst && (execute_state.insn_opcode == OpcodeLoad);
+  assign dmem.ARADDR  = {x_alu_result[31:2], 2'b00};
+  assign dmem.ARPROT  = 3'b000;
+  assign dmem.RREADY  = 1'b1;
+  assign dmem.AWVALID = !rst && (execute_state.insn_opcode == OpcodeStore);
+  assign dmem.AWADDR  = {x_alu_result[31:2], 2'b00};
+  assign dmem.AWPROT  = 3'b000;
+  assign dmem.WVALID  = !rst && (execute_state.insn_opcode == OpcodeStore);
+  assign dmem.WDATA   = x_store_data_to_dmem;
+  assign dmem.WSTRB   = x_store_wstrb_to_dmem;
+  assign dmem.BREADY  = 1'b1;
 
   /***************/
   /* FETCH STAGE */
@@ -318,6 +330,15 @@ module DatapathPipelinedAxil (
   assign g_to_decode_cycle_status =
       g_state.flush_tag ? CYCLE_TAKEN_BRANCH : g_state.cycle_status;
 
+  logic frontend_has_decoded;
+  always_ff @(posedge clk) begin
+    if (rst) begin
+      frontend_has_decoded <= 1'b0;
+    end else if (g_to_decode_valid) begin
+      frontend_has_decoded <= 1'b1;
+    end
+  end
+
   wire [255:0] g_disasm;
   Disasm #(
       .PREFIX("G")
@@ -351,7 +372,11 @@ module DatapathPipelinedAxil (
           cycle_status: g_to_decode_cycle_status
       };
     end else begin
-      decode_state <= '{pc: 0, insn: 0, cycle_status: CYCLE_IMEM_WAIT};
+      decode_state <= '{
+          pc: 0,
+          insn: 0,
+          cycle_status: frontend_has_decoded ? CYCLE_IMEM_WAIT : CYCLE_RESET
+      };
     end
   end
   wire [255:0] d_disasm;
@@ -373,7 +398,9 @@ module DatapathPipelinedAxil (
   wire [6:0] d_insn_opcode = decode_state.insn[6:0];
 
   // load use stall
-  wire d_uses_rs2 = (d_insn_opcode == OpcodeRegReg) || (d_insn_opcode == OpcodeBranch);
+  wire d_uses_rs2 = (d_insn_opcode == OpcodeRegReg) ||
+                    (d_insn_opcode == OpcodeBranch) ||
+                    (d_insn_opcode == OpcodeStore);
   wire d_load_use_stall =
   (execute_state.insn_opcode == OpcodeLoad) &&
   (execute_state.cycle_status != CYCLE_RESET) &&
@@ -925,6 +952,55 @@ module DatapathPipelinedAxil (
     endcase
   end
 
+  always_comb begin
+    x_store_data_to_dmem = 32'd0;
+    x_store_wstrb_to_dmem = 4'b0000;
+
+    if (execute_state.insn_opcode == OpcodeStore) begin
+      case (execute_state.insn_funct3)
+        3'b000: begin  // sb
+          case (x_alu_result[1:0])
+            2'b00: begin
+              x_store_data_to_dmem = {24'b0, x_rs2_data[7:0]};
+              x_store_wstrb_to_dmem = 4'b0001;
+            end
+            2'b01: begin
+              x_store_data_to_dmem = {16'b0, x_rs2_data[7:0], 8'b0};
+              x_store_wstrb_to_dmem = 4'b0010;
+            end
+            2'b10: begin
+              x_store_data_to_dmem = {8'b0, x_rs2_data[7:0], 16'b0};
+              x_store_wstrb_to_dmem = 4'b0100;
+            end
+            2'b11: begin
+              x_store_data_to_dmem = {x_rs2_data[7:0], 24'b0};
+              x_store_wstrb_to_dmem = 4'b1000;
+            end
+            default: ;
+          endcase
+        end
+        3'b001: begin  // sh
+          case (x_alu_result[1:0])
+            2'b00: begin
+              x_store_data_to_dmem = {16'b0, x_rs2_data[15:0]};
+              x_store_wstrb_to_dmem = 4'b0011;
+            end
+            2'b10: begin
+              x_store_data_to_dmem = {x_rs2_data[15:0], 16'b0};
+              x_store_wstrb_to_dmem = 4'b1100;
+            end
+            default: ;
+          endcase
+        end
+        3'b010: begin  // sw
+          x_store_data_to_dmem = x_rs2_data;
+          x_store_wstrb_to_dmem = 4'b1111;
+        end
+        default: ;
+      endcase
+    end
+  end
+
   // flush: when a branch is taken in Execute, flush Fetch, G, and Decode
   wire x_flush = x_branch_taken &&
                  (execute_state.cycle_status != CYCLE_RESET) &&
@@ -1024,65 +1100,8 @@ module DatapathPipelinedAxil (
   assign m_alu_result = memory_state.alu_result;
   assign m_we         = memory_state.we;
 
-  // WM bypass: if W writes the same reg as the store's rs2, use W's value (M's rs2_data is stale).
-  wire [`REG_SIZE] m_rs2_data_bypassed =
-      (w_we && w_rd != 5'd0 && w_rd == memory_state.insn_rs2) ? w_rd_data : memory_state.rs2_data;
-
-  // memory stage: handle loads/stores
+  // memory stage: format load data returned by the AXIL data memory
   logic [`REG_SIZE] m_load_data;
-
-  always_comb begin
-    addr_to_dmem       = 32'd0;
-    store_data_to_dmem = 32'd0;
-    store_we_to_dmem   = 4'd0;
-
-    if (memory_state.insn_opcode == OpcodeLoad) begin
-      addr_to_dmem = {memory_state.alu_result[31:2], 2'b00};
-    end else if (memory_state.insn_opcode == OpcodeStore) begin
-      addr_to_dmem = {memory_state.alu_result[31:2], 2'b00};
-      case (memory_state.insn_funct3)
-        3'b000: begin  // sb
-          case (memory_state.alu_result[1:0])
-            2'b00: begin
-              store_data_to_dmem = {24'b0, m_rs2_data_bypassed[7:0]};
-              store_we_to_dmem   = 4'b0001;
-            end
-            2'b01: begin
-              store_data_to_dmem = {16'b0, m_rs2_data_bypassed[7:0], 8'b0};
-              store_we_to_dmem   = 4'b0010;
-            end
-            2'b10: begin
-              store_data_to_dmem = {8'b0, m_rs2_data_bypassed[7:0], 16'b0};
-              store_we_to_dmem   = 4'b0100;
-            end
-            2'b11: begin
-              store_data_to_dmem = {m_rs2_data_bypassed[7:0], 24'b0};
-              store_we_to_dmem   = 4'b1000;
-            end
-            default: ;
-          endcase
-        end
-        3'b001: begin  // sh
-          case (memory_state.alu_result[1:0])
-            2'b00: begin
-              store_data_to_dmem = {16'b0, m_rs2_data_bypassed[15:0]};
-              store_we_to_dmem   = 4'b0011;
-            end
-            2'b10: begin
-              store_data_to_dmem = {m_rs2_data_bypassed[15:0], 16'b0};
-              store_we_to_dmem   = 4'b1100;
-            end
-            default: ;
-          endcase
-        end
-        3'b010: begin  // sw
-          store_data_to_dmem = m_rs2_data_bypassed;
-          store_we_to_dmem   = 4'b1111;
-        end
-        default: ;
-      endcase
-    end
-  end
 
   // select what data goes to writeback for loads
   always_comb begin
@@ -1091,34 +1110,34 @@ module DatapathPipelinedAxil (
       case (memory_state.insn_funct3)
         3'b000: begin  // lb
           case (memory_state.alu_result[1:0])
-            2'b00:   m_load_data = {{24{load_data_from_dmem[7]}}, load_data_from_dmem[7:0]};
-            2'b01:   m_load_data = {{24{load_data_from_dmem[15]}}, load_data_from_dmem[15:8]};
-            2'b10:   m_load_data = {{24{load_data_from_dmem[23]}}, load_data_from_dmem[23:16]};
-            2'b11:   m_load_data = {{24{load_data_from_dmem[31]}}, load_data_from_dmem[31:24]};
+            2'b00:   m_load_data = {{24{dmem.RDATA[7]}}, dmem.RDATA[7:0]};
+            2'b01:   m_load_data = {{24{dmem.RDATA[15]}}, dmem.RDATA[15:8]};
+            2'b10:   m_load_data = {{24{dmem.RDATA[23]}}, dmem.RDATA[23:16]};
+            2'b11:   m_load_data = {{24{dmem.RDATA[31]}}, dmem.RDATA[31:24]};
             default: m_load_data = 32'd0;
           endcase
         end
         3'b001: begin  // lh
           case (memory_state.alu_result[1:0])
-            2'b00:   m_load_data = {{16{load_data_from_dmem[15]}}, load_data_from_dmem[15:0]};
-            2'b10:   m_load_data = {{16{load_data_from_dmem[31]}}, load_data_from_dmem[31:16]};
+            2'b00:   m_load_data = {{16{dmem.RDATA[15]}}, dmem.RDATA[15:0]};
+            2'b10:   m_load_data = {{16{dmem.RDATA[31]}}, dmem.RDATA[31:16]};
             default: m_load_data = 32'd0;
           endcase
         end
-        3'b010:  m_load_data = load_data_from_dmem;  // lw
+        3'b010:  m_load_data = dmem.RDATA;  // lw
         3'b100: begin  // lbu
           case (memory_state.alu_result[1:0])
-            2'b00:   m_load_data = {24'b0, load_data_from_dmem[7:0]};
-            2'b01:   m_load_data = {24'b0, load_data_from_dmem[15:8]};
-            2'b10:   m_load_data = {24'b0, load_data_from_dmem[23:16]};
-            2'b11:   m_load_data = {24'b0, load_data_from_dmem[31:24]};
+            2'b00:   m_load_data = {24'b0, dmem.RDATA[7:0]};
+            2'b01:   m_load_data = {24'b0, dmem.RDATA[15:8]};
+            2'b10:   m_load_data = {24'b0, dmem.RDATA[23:16]};
+            2'b11:   m_load_data = {24'b0, dmem.RDATA[31:24]};
             default: m_load_data = 32'd0;
           endcase
         end
         3'b101: begin  // lhu
           case (memory_state.alu_result[1:0])
-            2'b00:   m_load_data = {16'b0, load_data_from_dmem[15:0]};
-            2'b10:   m_load_data = {16'b0, load_data_from_dmem[31:16]};
+            2'b00:   m_load_data = {16'b0, dmem.RDATA[15:0]};
+            2'b10:   m_load_data = {16'b0, dmem.RDATA[31:16]};
             default: m_load_data = 32'd0;
           endcase
         end
