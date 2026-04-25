@@ -183,6 +183,9 @@ module DatapathPipelinedAxil (
 
   stage_g_t g_state;
 
+  wire imem_ar_handshake = imem.ARVALID && imem.ARREADY;
+  wire imem_r_handshake = imem.RVALID && imem.RREADY;
+
   always_ff @(posedge clk) begin
     if (rst) begin
       g_state <= '{
@@ -192,17 +195,83 @@ module DatapathPipelinedAxil (
           insn_captured: 0,
           flush_tag: 0
       };
+    end else begin
+      case (g_state.state)
+        G_EMPTY: begin
+          // A new AR handshake creates the in-flight G slot.
+          if (imem_ar_handshake) begin
+            g_state <= '{
+                pc: f_pc_current,
+                cycle_status: f_cycle_status,
+                state: G_PENDING,
+                insn_captured: 0,
+                flush_tag: 0
+            };
+          end else begin
+            g_state <= g_state;
+          end
+        end
+        G_PENDING: begin
+          // If Decode is ready, returned RDATA bypasses G storage directly into D.
+          if (imem_r_handshake && g_decode_can_accept) begin
+            if (imem_ar_handshake) begin
+              g_state <= '{
+                  pc: f_pc_current,
+                  cycle_status: f_cycle_status,
+                  state: G_PENDING,
+                  insn_captured: 0,
+                  flush_tag: 0
+              };
+            end else begin
+              g_state <= '{pc: 0, cycle_status: CYCLE_NO_STALL, state: G_EMPTY, insn_captured: 0, flush_tag: 0};
+            end
+          end else if (imem_r_handshake) begin
+            // Decode is stalled, so hold the returned instruction for a later cycle.
+            g_state <= '{
+                pc: g_state.pc,
+                cycle_status: g_state.cycle_status,
+                state: G_HOLDING,
+                insn_captured: imem.RDATA,
+                flush_tag: g_state.flush_tag
+            };
+          end else begin
+            g_state <= g_state;
+          end
+        end
+        G_HOLDING: begin
+          // Drain captured RDATA once Decode can accept it.
+          if (g_decode_can_accept) begin
+            if (imem_ar_handshake) begin
+              g_state <= '{
+                  pc: f_pc_current,
+                  cycle_status: f_cycle_status,
+                  state: G_PENDING,
+                  insn_captured: 0,
+                  flush_tag: 0
+              };
+            end else begin
+              g_state <= '{pc: 0, cycle_status: CYCLE_NO_STALL, state: G_EMPTY, insn_captured: 0, flush_tag: 0};
+            end
+          end else begin
+            g_state <= g_state;
+          end
+        end
+        default: begin
+          g_state <= '{pc: 0, cycle_status: CYCLE_NO_STALL, state: G_EMPTY, insn_captured: 0, flush_tag: 0};
+        end
+      endcase
     end
   end
 
   wire g_decode_can_accept = !d_load_use_stall && !x_div_stall_upstream;
-  wire g_can_accept_request = (g_state.state == G_EMPTY) ||
-  // if holding and the decode stage can accept the request, then we can issue
-  // as g will drain to d next cycle and d will be able to accept the request
-  (g_state.state == G_HOLDING && g_decode_can_accept) ||
-  // if waiting for memory and memory will return a response this cycle and
-  // the decode stage can accept the request, then we can issue
-  (g_state.state == G_PENDING && imem.RVALID && g_decode_can_accept);
+  wire g_can_accept_request = 
+    (g_state.state == G_EMPTY) ||
+    // if holding and the decode stage can accept the request, then we can issue
+    // as g will drain to d next cycle and d will be able to accept the request
+    (g_state.state == G_HOLDING && g_decode_can_accept) ||
+    // if waiting for memory and memory will return a response this cycle and
+    // the decode stage can accept the request, then we can issue
+    (g_state.state == G_PENDING && imem.RVALID && g_decode_can_accept);
 
   wire imem_rready =
   // if empty, we can always accept the request
@@ -212,6 +281,16 @@ module DatapathPipelinedAxil (
   // if holding and the decode stage can accept the request, then we can accept the request
   (g_state.state == G_HOLDING && g_decode_can_accept);
   assign imem.RREADY = imem_rready;
+
+  // Decode uses live RDATA when possible; otherwise it drains captured HOLDING data.
+  wire g_response_bypasses_to_decode = (g_state.state == G_PENDING) && imem_r_handshake && g_decode_can_accept;
+  wire g_holding_drains_to_decode = (g_state.state == G_HOLDING) && g_decode_can_accept;
+  wire g_to_decode_valid = g_response_bypasses_to_decode || g_holding_drains_to_decode;
+  wire [`INSN_SIZE] g_to_decode_insn =
+      g_response_bypasses_to_decode ? imem.RDATA : g_state.insn_captured;
+  cycle_status_e g_to_decode_cycle_status;
+  assign g_to_decode_cycle_status =
+      g_state.flush_tag ? CYCLE_TAKEN_BRANCH : g_state.cycle_status;
 
   /****************/
   /* DECODE STAGE */
@@ -231,8 +310,14 @@ module DatapathPipelinedAxil (
     end else if (x_div_stall_upstream) begin
       // freeze while divider is running
       decode_state <= decode_state;
+    end else if (g_to_decode_valid) begin
+      decode_state <= '{
+          pc: g_state.pc,
+          insn: g_to_decode_insn,
+          cycle_status: g_to_decode_cycle_status
+      };
     end else begin
-      decode_state <= '{pc: f_pc_current, insn: f_insn, cycle_status: f_cycle_status};
+      decode_state <= '{pc: 0, insn: 0, cycle_status: CYCLE_IMEM_WAIT};
     end
   end
   wire [255:0] d_disasm;
