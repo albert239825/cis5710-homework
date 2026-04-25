@@ -139,7 +139,6 @@ module DatapathPipelinedAxil (
   /***************/
 
   logic [`REG_SIZE] f_pc_current;
-  wire [`REG_SIZE] f_insn;
   cycle_status_e f_cycle_status;
 
   // program counter — updated in Execute stage below when branch is taken
@@ -151,17 +150,6 @@ module DatapathPipelinedAxil (
   // 2. The pipeline is flushing
   // 3. The G stage is not able to accept the request
   assign imem.ARVALID = !rst && !x_flush && g_can_accept_request;
-  assign f_insn = imem.RDATA;
-
-  // Here's how to disassemble an insn into a string you can view in GtkWave.
-  // Use PREFIX to provide a 1-character tag to identify which stage the insn comes from.
-  wire [255:0] f_disasm;
-  Disasm #(
-      .PREFIX("F")
-  ) disasm_0fetch (
-      .insn  (f_insn),
-      .disasm(f_disasm)
-  );
 
   /***********/
   /* G STAGE */
@@ -195,6 +183,40 @@ module DatapathPipelinedAxil (
           insn_captured: 0,
           flush_tag: 0
       };
+    end else if (x_flush) begin
+      case (g_state.state)
+        G_PENDING: begin
+          if (imem_r_handshake) begin
+            g_state <= '{
+                pc: g_state.pc,
+                cycle_status: CYCLE_TAKEN_BRANCH,
+                state: G_HOLDING,
+                insn_captured: imem.RDATA,
+                flush_tag: 1'b1
+            };
+          end else begin
+            g_state <= '{
+                pc: g_state.pc,
+                cycle_status: CYCLE_TAKEN_BRANCH,
+                state: G_PENDING,
+                insn_captured: g_state.insn_captured,
+                flush_tag: 1'b1
+            };
+          end
+        end
+        G_HOLDING: begin
+          g_state <= '{
+              pc: g_state.pc,
+              cycle_status: CYCLE_TAKEN_BRANCH,
+              state: G_HOLDING,
+              insn_captured: g_state.insn_captured,
+              flush_tag: 1'b1
+          };
+        end
+        default: begin
+          g_state <= g_state;
+        end
+      endcase
     end else begin
       case (g_state.state)
         G_EMPTY: begin
@@ -286,11 +308,23 @@ module DatapathPipelinedAxil (
   wire g_response_bypasses_to_decode = (g_state.state == G_PENDING) && imem_r_handshake && g_decode_can_accept;
   wire g_holding_drains_to_decode = (g_state.state == G_HOLDING) && g_decode_can_accept;
   wire g_to_decode_valid = g_response_bypasses_to_decode || g_holding_drains_to_decode;
+  // PC is zeroed for flushed slots to match the usual bubble shape.
+  wire [`REG_SIZE] g_to_decode_pc = g_state.flush_tag ? 32'd0 : g_state.pc;
   wire [`INSN_SIZE] g_to_decode_insn =
-      g_response_bypasses_to_decode ? imem.RDATA : g_state.insn_captured;
+      g_state.flush_tag ? 32'd0 :
+      g_response_bypasses_to_decode ? imem.RDATA :
+      g_state.insn_captured;
   cycle_status_e g_to_decode_cycle_status;
   assign g_to_decode_cycle_status =
       g_state.flush_tag ? CYCLE_TAKEN_BRANCH : g_state.cycle_status;
+
+  wire [255:0] g_disasm;
+  Disasm #(
+      .PREFIX("G")
+  ) disasm_0going (
+      .insn  (g_to_decode_insn),
+      .disasm(g_disasm)
+  );
 
   /****************/
   /* DECODE STAGE */
@@ -312,7 +346,7 @@ module DatapathPipelinedAxil (
       decode_state <= decode_state;
     end else if (g_to_decode_valid) begin
       decode_state <= '{
-          pc: g_state.pc,
+          pc: g_to_decode_pc,
           insn: g_to_decode_insn,
           cycle_status: g_to_decode_cycle_status
       };
