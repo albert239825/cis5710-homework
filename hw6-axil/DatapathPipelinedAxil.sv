@@ -925,7 +925,7 @@ module DatapathPipelinedAxil (
     endcase
   end
 
-  // flush: when a branch is taken in Execute, flush Fetch and Decode
+  // flush: when a branch is taken in Execute, flush Fetch, G, and Decode
   wire x_flush = x_branch_taken &&
                  (execute_state.cycle_status != CYCLE_RESET) &&
                  (execute_state.insn_opcode == OpcodeBranch ||
@@ -940,7 +940,7 @@ module DatapathPipelinedAxil (
       f_pc_current   <= 32'd0;
       f_cycle_status <= CYCLE_NO_STALL;
     end else if (x_flush) begin
-      // branch taken: next fetch from branch target
+      // Flush F by suppressing ARVALID this cycle and redirecting to the branch target.
       f_pc_current   <= x_branch_target;
       f_cycle_status <= CYCLE_NO_STALL;
     end else if (imem.ARVALID && imem.ARREADY) begin
